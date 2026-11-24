@@ -1,3 +1,7 @@
+"""Bloque Transformer pre-LN con FFN de spikes."""
+from __future__ import annotations
+
+import torch
 import torch.nn as nn
 
 from .attention import MultiHeadAttention
@@ -5,8 +9,6 @@ from .snn import SpikingFFN
 
 
 class TransformerBlock(nn.Module):
-    """Pre-LN transformer con FFN de spikes y residual connections."""
-
     def __init__(self, config):
         super().__init__()
         self.ln1 = nn.LayerNorm(config.n_embd)
@@ -14,13 +16,22 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.ffn = SpikingFFN(
             config.n_embd,
-            mult=4,
+            mult=config.spiking_mult,
             threshold=config.spiking_threshold,
             alpha=config.spiking_alpha,
             dropout=config.dropout,
+            use_spiking=config.use_spiking,
         )
 
-    def forward(self, x, cos, sin):
-        x = x + self.attn(self.ln1(x), cos, sin)
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache=None,
+        start_pos: int = 0,
+    ):
+        attn_out, new_kv = self.attn(self.ln1(x), cos, sin, kv_cache, start_pos)
+        x = x + attn_out
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, new_kv
