@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "snn-lm-v3"
+version = "3.1.0"
+description = "Causal transformer with surrogate-gradient spiking FFN (LIF), RoPE, and symbolic reasoning layer over the corpus."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SNN-LM v3 contributors" }]
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+    "tiktoken>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+snnlm-train = "scripts.train:main"
+snnlm-generate = "scripts.generate:main"
+snnlm-reason = "scripts.reason:main"
+
+[tool.setuptools.packages.find]
+include = ["snn_lm_v3*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-q"
