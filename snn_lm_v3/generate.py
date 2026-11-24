@@ -21,7 +21,6 @@ def generate(
     enc = tiktoken.get_encoding(enc_name)
     device = device or next(model.parameters()).device
     model.eval()
-
     if seed is not None:
         torch.manual_seed(seed)
 
