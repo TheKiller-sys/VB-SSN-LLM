@@ -1,3 +1,6 @@
+"""SNN-LM: transformer estilo GPT-2 con FFN de spikes."""
+from __future__ import annotations
+
 import math
 
 import torch
@@ -9,8 +12,6 @@ from .rope import precompute_rope
 
 
 class SNNLM(nn.Module):
-    """Transformer estilo GPT-2 con FFN de spikes. Weight tying."""
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -22,7 +23,6 @@ class SNNLM(nn.Module):
         )
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-
         self.head.weight = self.tok_emb.weight  # weight tying
 
         head_dim = config.n_embd // config.n_head
@@ -43,20 +43,25 @@ class SNNLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def num_params(self):
+    def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def forward(self, idx, targets=None):
+    def _forward(self, idx, kv_caches=None, start_pos: int = 0):
         B, T = idx.shape
-        x = self.tok_emb(idx)
-        x = self.drop(x)
+        x = self.drop(self.tok_emb(idx))
 
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
+        new_kv_caches = [] if kv_caches is not None else None
+        for i, block in enumerate(self.blocks):
+            kv = kv_caches[i] if kv_caches is not None else None
+            x, new_kv = block(x, self.rope_cos, self.rope_sin, kv, start_pos)
+            if new_kv_caches is not None:
+                new_kv_caches.append(new_kv)
 
-        x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.head(self.ln_f(x))
+        return logits, new_kv_caches
 
+    def forward(self, idx, targets=None, kv_caches=None, start_pos: int = 0):
+        logits, new_kv_caches = self._forward(idx, kv_caches, start_pos)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
@@ -64,29 +69,79 @@ class SNNLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+        if kv_caches is not None:
+            return logits, loss, new_kv_caches
         return logits, loss
 
+    @staticmethod
+    def _apply_sampling(logits, temperature, top_k, top_p):
+        logits = logits / max(temperature, 1e-8)
+
+        if top_k is not None and top_k > 0:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits = torch.where(
+                logits < v[:, [-1]],
+                torch.full_like(logits, float("-inf")),
+                logits,
+            )
+
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            probs = F.softmax(sorted_logits, dim=-1)
+            cum = probs.cumsum(dim=-1)
+            mask = cum - probs > top_p
+            mask[..., 0] = False  # conservar al menos 1 token
+            sorted_logits = sorted_logits.masked_fill(mask, float("-inf"))
+            logits = torch.full_like(logits, float("-inf"))
+            logits.scatter_(1, sorted_idx, sorted_logits)
+
+        return F.softmax(logits, dim=-1)
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.seq_len:]
-            logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 1e-8)
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        self.eval()
+        seq_len = self.config.seq_len
 
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = float("-inf")
+        if idx.size(1) > seq_len:
+            idx = idx[:, -seq_len:]
 
-            if top_p is not None and top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                probs = F.softmax(sorted_logits, dim=-1)
-                cum = probs.cumsum(dim=-1)
-                mask = cum - probs > top_p
-                sorted_logits[mask] = float("-inf")
-                logits = torch.full_like(logits, float("-inf"))
-                logits.scatter_(1, sorted_idx, sorted_logits)
+        cache_active = use_cache
+        kv_caches = [None] * len(self.blocks) if use_cache else None
 
-            probs = F.softmax(logits, dim=-1)
+        if use_cache:
+            logits, _, kv_caches = self(idx, kv_caches=kv_caches, start_pos=0)
+        else:
+            logits, _ = self(idx)
+        pos = idx.size(1)
+        logits = logits[:, -1, :]
+
+        for step in range(max_new_tokens):
+            probs = self._apply_sampling(logits, temperature, top_k, top_p)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, idx_next], dim=1)
+
+            if step == max_new_tokens - 1:
+                break
+
+            if cache_active and pos < seq_len:
+                logits, _, kv_caches = self(
+                    idx_next, kv_caches=kv_caches, start_pos=pos
+                )
+                pos += 1
+                logits = logits[:, -1, :]
+            else:
+                cache_active = False
+                kv_caches = None
+                idx_cond = idx[:, -seq_len:]
+                logits, _ = self(idx_cond)
+                logits = logits[:, -1, :]
+
         return idx
