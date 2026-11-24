@@ -1,18 +1,21 @@
 """
-Demo end-to-end: genera corpus sintético, entrena tiny, evalúa, genera.
-Ejecuta: python main.py
+Demo end-to-end. Genera corpus sintético, entrena, evalúa y genera.
+
+Ejecuta:
+    python main.py
+    python main.py --size small --steps 1000 --device cuda
 """
+from __future__ import annotations
+
+import argparse
 import logging
 import os
 import tempfile
 
-import torch
-
 from snn_lm_v3 import (
-    GPTConfig, SIZE_TINY, SNNLM,
-    make_dataloader, train, evaluate, generate,
+    GPTConfig, SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE,
+    SNNLM, make_dataloader, train, evaluate, generate, resolve_device,
 )
-from snn_lm_v3.checkpoint import save_checkpoint
 
 
 DEMO = """The quick brown fox jumps over the lazy dog.
@@ -27,10 +30,24 @@ Practice makes perfect.
 Every cloud has a silver lining.
 """ * 500
 
+SIZES = {
+    "tiny": SIZE_TINY,
+    "small": SIZE_SMALL,
+    "medium": SIZE_MEDIUM,
+    "large": SIZE_LARGE,
+}
+
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
-                        datefmt="%H:%M:%S")
+    p = argparse.ArgumentParser()
+    p.add_argument("--size", choices=list(SIZES.keys()), default="tiny")
+    p.add_argument("--steps", type=int, default=200)
+    p.add_argument("--device", default="auto")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S"
+    )
     logger = logging.getLogger("demo")
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -40,22 +57,30 @@ def main():
             f.write(DEMO)
 
         cfg = GPTConfig(
-            **SIZE_TINY,
-            seq_len=128, batch_size=8, lr=3e-4,
-            max_steps=200, warmup_steps=20,
-            log_every=20, eval_every=100, ckpt_every=100,
+            **SIZES[args.size],
+            seq_len=128,
+            batch_size=8,
+            lr=3e-4,
+            max_steps=args.steps,
+            warmup_steps=min(20, max(1, args.steps // 10)),
+            log_every=max(1, args.steps // 10),
+            eval_every=max(100, args.steps // 2),
+            ckpt_every=max(100, args.steps // 2),
             out_dir=os.path.join(tmp, "ckpt"),
-            device="cpu", use_amp=False,
+            device=args.device,
+            use_amp=False,
         )
 
-        device = torch.device(cfg.device)
+        device = resolve_device(cfg.device)
         model = SNNLM(cfg).to(device)
-        logger.info(f"Parámetros: {model.num_params():,}")
-
-        train_dl, val_dl, enc = make_dataloader(
-            [data_dir], cfg.seq_len, cfg.batch_size, seed=42,
+        logger.info(
+            f"Size={args.size} params={model.num_params():,} device={device}"
         )
-        logger.info(f"Train batches: {len(train_dl)}")
+
+        train_dl, val_dl, _ = make_dataloader(
+            [data_dir], cfg.seq_len, cfg.batch_size, seed=42
+        )
+        logger.info(f"Train batches={len(train_dl)} Val batches={len(val_dl)}")
 
         model = train(model, train_dl, val_dl, cfg, logger)
 
@@ -64,9 +89,14 @@ def main():
 
         logger.info("Generación:")
         text = generate(
-            model, prompt="The quick brown",
-            max_new_tokens=80, temperature=0.8, top_k=40, top_p=0.95,
-            seed=1, device=device,
+            model,
+            prompt="The quick brown",
+            max_new_tokens=80,
+            temperature=0.8,
+            top_k=40,
+            top_p=0.95,
+            seed=1,
+            device=device,
         )
         logger.info(f"\n{text}")
 
