@@ -1,4 +1,4 @@
-"""Bucle de entrenamiento con resume, grad-accum, AMP, eval y checkpoints."""
+"""Bucle de entrenamiento con resume, grad-accum, AMP y eval."""
 from __future__ import annotations
 
 import math
@@ -8,14 +8,16 @@ from contextlib import nullcontext
 
 import torch
 
-from .checkpoint import save_checkpoint
+from .checkpoint import save_checkpoint, _unwrap
 from .config import resolve_device
 
 
 def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> float:
-    if step < warmup:
-        return (step + 1) / max(1, warmup)
-    progress = min((step - warmup) / max(1, total - warmup), 1.0)
+    if warmup > 0 and step < warmup:
+        return (step + 1) / warmup
+    if total <= warmup:
+        return 1.0
+    progress = min((step - warmup) / (total - warmup), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_ratio + (1.0 - min_ratio) * cosine
 
@@ -24,8 +26,7 @@ def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> fl
 def evaluate(model, val_dl, device, max_batches: int = 50) -> dict:
     was_training = model.training
     model.eval()
-    total_loss = 0.0
-    n = 0
+    total_loss, n = 0.0, 0
     for i, (x, y) in enumerate(val_dl):
         if i >= max_batches:
             break
@@ -37,16 +38,41 @@ def evaluate(model, val_dl, device, max_batches: int = 50) -> dict:
     if was_training:
         model.train()
     if n == 0:
-        return {"loss": float("nan"), "ppl": float("nan")}
+        return {"loss": float("nan"), "ppl": float("nan"), "n": 0}
     avg = total_loss / n
-    return {"loss": avg, "ppl": math.exp(min(avg, 20.0))}
+    return {"loss": avg, "ppl": math.exp(min(avg, 20.0)), "n": n}
 
 
-def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
-          optimizer: torch.optim.Optimizer | None = None,
-          optimizer_state=None, scheduler_state=None):
+def _build_optimizer(model, config, state=None):
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=(config.beta1, config.beta2),
+        eps=1e-8,
+    )
+    if state is not None:
+        opt.load_state_dict(state)
+    return opt
+
+
+def train(
+    model,
+    train_dl,
+    val_dl,
+    config,
+    logger=None,
+    start_step: int = 0,
+    optimizer: torch.optim.Optimizer | None = None,
+    optimizer_state=None,
+    scheduler_state=None,
+    best_val_loss: float | None = None,
+):
     device = resolve_device(config.device)
     model = model.to(device)
+
+    if optimizer is None:
+        optimizer = _build_optimizer(model, config, optimizer_state)
 
     if config.compile and hasattr(torch, "compile"):
         try:
@@ -56,17 +82,6 @@ def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
         except Exception as e:
             if logger:
                 logger.warning(f"torch.compile falló: {e}")
-
-    if optimizer is None:
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2),
-            eps=1e-8,
-        )
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
 
     min_ratio = config.min_lr / config.lr if config.lr > 0 else 0.0
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -78,25 +93,45 @@ def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
     elif start_step > 0:
         scheduler.step(start_step)
 
-    use_amp = config.use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    autocast_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
-    )
+    if config.use_amp and device.type == "cuda":
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
+        autocast_ctx = torch.amp.autocast("cuda", dtype=torch.float16)
+        use_amp = True
+    elif config.use_amp and device.type == "cpu":
+        scaler = None
+        autocast_ctx = torch.amp.autocast("cpu", dtype=torch.bfloat16)
+        use_amp = True
+    else:
+        scaler = None
+        autocast_ctx = nullcontext()
+        use_amp = False
 
     accum = max(1, config.grad_accum_steps)
     step = start_step
     micro_step = 0
     t0 = time.time()
     model.train()
+    optimizer.zero_grad(set_to_none=True)
+    if best_val_loss is None:
+        best_val_loss = float("inf")
 
     if logger:
         logger.info(
-            f"Entrenando: device={device} amp={use_amp} "
-            f"accum={accum} start_step={start_step} max_steps={config.max_steps}"
+            f"Entrenando: device={device} amp={use_amp} accum={accum} "
+            f"start_step={start_step} max_steps={config.max_steps} "
+            f"params={sum(p.numel() for p in _unwrap(model).parameters()):,}"
         )
 
-    optimizer.zero_grad(set_to_none=True)
+    def _save(tag: str) -> None:
+        save_checkpoint(
+            model,
+            optimizer,
+            scheduler,
+            config,
+            step,
+            os.path.join(config.out_dir, tag),
+            best_val_loss,
+        )
 
     while step < config.max_steps:
         for x, y in train_dl:
@@ -107,20 +142,29 @@ def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
                 _, loss = model(x, y)
                 loss_scaled = loss / accum
 
-            scaler.scale(loss_scaled).backward()
-            micro_step += 1
+            if scaler is not None:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
 
+            micro_step += 1
             if micro_step % accum != 0:
                 continue
 
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                _unwrap(model).parameters(), config.grad_clip
+            )
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
-            if step % config.log_every == 0 and logger:
+            if config.log_every > 0 and step % config.log_every == 0 and logger:
                 lr = scheduler.get_last_lr()[0]
                 logger.info(
                     f"step={step} loss={loss.item():.4f} "
@@ -128,32 +172,25 @@ def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
                     f"lr={lr:.2e} t={time.time() - t0:.0f}s"
                 )
 
-            if (
-                config.eval_every > 0
-                and step > 0
-                and step % config.eval_every == 0
-            ):
+            if config.eval_every > 0 and step > 0 and step % config.eval_every == 0:
                 metrics = evaluate(model, val_dl, device, config.eval_batches)
                 if logger:
                     logger.info(
                         f"[eval] step={step} loss={metrics['loss']:.4f} "
-                        f"ppl={metrics['ppl']:.2f}"
+                        f"ppl={metrics['ppl']:.2f} n={metrics['n']}"
                     )
+                if metrics["loss"] < best_val_loss:
+                    best_val_loss = metrics["loss"]
+                    _save("best.pt")
+                    if logger:
+                        logger.info(
+                            f"[ckpt] best.pt guardado (val_loss={best_val_loss:.4f})"
+                        )
                 model.train()
 
-            if (
-                config.ckpt_every > 0
-                and step > 0
-                and step % config.ckpt_every == 0
-            ):
-                save_checkpoint(
-                    model, optimizer, scheduler, config, step,
-                    os.path.join(config.out_dir, f"step_{step}.pt"),
-                )
-                save_checkpoint(
-                    model, optimizer, scheduler, config, step,
-                    os.path.join(config.out_dir, "latest.pt"),
-                )
+            if config.ckpt_every > 0 and step > 0 and step % config.ckpt_every == 0:
+                _save(f"step_{step}.pt")
+                _save("latest.pt")
                 if logger:
                     logger.info(f"[ckpt] step={step} guardado")
 
@@ -161,10 +198,9 @@ def train(model, train_dl, val_dl, config, logger=None, start_step: int = 0,
             if step >= config.max_steps:
                 break
 
-    save_checkpoint(
-        model, optimizer, scheduler, config, step,
-        os.path.join(config.out_dir, "final.pt"),
-    )
+    _save("final.pt")
     if logger:
-        logger.info(f"Entrenamiento completo: {step} pasos")
-    return model
+        logger.info(
+            f"Entrenamiento completo: {step} pasos, best_val_loss={best_val_loss:.4f}"
+        )
+    return _unwrap(model)
