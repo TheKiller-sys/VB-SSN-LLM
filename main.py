@@ -1,9 +1,9 @@
 """
-Demo end-to-end. Genera corpus sintético, entrena, evalúa y genera.
+Demo end-to-end: genera corpus sintético, entrena, evalúa, razona y genera.
 
-Ejecuta:
     python main.py
     python main.py --size small --steps 1000 --device cuda
+    python main.py --size tiny --steps 100 --no-reasoning
 """
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ import os
 import tempfile
 
 from snn_lm_v3 import (
-    GPTConfig, SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE,
-    SNNLM, make_dataloader, train, evaluate, generate, resolve_device,
+    GPTConfig, SIZES, SNNLM, make_dataloader, train, evaluate, generate,
+    resolve_device, load_texts,
+    CorpusObserver, ReasoningGraph, ConsistencyVerifier, save_graph,
 )
-
 
 DEMO = """The quick brown fox jumps over the lazy dog.
 A journey of a thousand miles begins with a single step.
@@ -30,19 +30,13 @@ Practice makes perfect.
 Every cloud has a silver lining.
 """ * 500
 
-SIZES = {
-    "tiny": SIZE_TINY,
-    "small": SIZE_SMALL,
-    "medium": SIZE_MEDIUM,
-    "large": SIZE_LARGE,
-}
-
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--size", choices=list(SIZES.keys()), default="tiny")
     p.add_argument("--steps", type=int, default=200)
     p.add_argument("--device", default="auto")
+    p.add_argument("--no-reasoning", action="store_true")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -56,26 +50,46 @@ def main():
         with open(os.path.join(data_dir, "demo.txt"), "w", encoding="utf-8") as f:
             f.write(DEMO)
 
+        # ---------------- razonamiento sobre corpus ----------------
+        observer, graph = None, None
+        if not args.no_reasoning:
+            observer = CorpusObserver(enc_name="gpt2")
+            for j in range(0, len(DEMO), 500):
+                observer.observe(DEMO[j : j + 500], ref=f"demo_{j}")
+            graph = ReasoningGraph(cooldown_steps=3)
+            n_rules = graph.mine_from_corpus(observer)
+            logger.info(
+                f"CorpusObserver: {observer.get_state()['vocabulary_size']} tokens, "
+                f"{observer.get_state()['transitions']} transiciones"
+            )
+            logger.info(
+                f"ReasoningGraph: {n_rules} reglas minadas, "
+                f"{graph.get_state()['rules_count']} totales"
+            )
+
+        # ---------------- modelo ----------------
         cfg = GPTConfig(
             **SIZES[args.size],
             seq_len=128,
             batch_size=8,
             lr=3e-4,
+            min_lr=3e-5,
             max_steps=args.steps,
             warmup_steps=min(20, max(1, args.steps // 10)),
             log_every=max(1, args.steps // 10),
-            eval_every=max(100, args.steps // 2),
-            ckpt_every=max(100, args.steps // 2),
+            eval_every=max(50, args.steps // 2),
+            ckpt_every=max(50, args.steps // 2),
+            eval_batches=10,
             out_dir=os.path.join(tmp, "ckpt"),
             device=args.device,
             use_amp=False,
+            snn_track_stats=True,
         )
+        cfg.validate()
 
         device = resolve_device(cfg.device)
         model = SNNLM(cfg).to(device)
-        logger.info(
-            f"Size={args.size} params={model.num_params():,} device={device}"
-        )
+        logger.info(f"Size={args.size} params={model.num_params():,} device={device}")
 
         train_dl, val_dl, _ = make_dataloader(
             [data_dir], cfg.seq_len, cfg.batch_size, seed=42
@@ -87,7 +101,7 @@ def main():
         metrics = evaluate(model, val_dl, device)
         logger.info(f"Eval final: {metrics}")
 
-        logger.info("Generación:")
+        # ---------------- generación + verificación ----------------
         text = generate(
             model,
             prompt="The quick brown",
@@ -99,6 +113,14 @@ def main():
             device=device,
         )
         logger.info(f"\n{text}")
+
+        if graph is not None and observer is not None:
+            verifier = ConsistencyVerifier()
+            problems = verifier.verify_against_corpus(text, graph, observer)
+            verdict = verifier.verdict(problems)
+            logger.info(f"Veredicto: {verdict}")
+            for p in problems:
+                logger.info(f"  - [{p.type}] {p.note}")
 
 
 if __name__ == "__main__":
