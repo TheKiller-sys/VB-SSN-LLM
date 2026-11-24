@@ -1,4 +1,4 @@
-"""Bloque Transformer pre-LN con FFN de spikes."""
+"""Bloque Transformer pre-LN con FFN configurable."""
 from __future__ import annotations
 
 import torch
@@ -21,16 +21,17 @@ class TransformerBlock(nn.Module):
             alpha=config.spiking_alpha,
             dropout=config.dropout,
             use_spiking=config.use_spiking,
+            residual=config.spiking_residual,
+            mode=config.snn_mode,
+            decay=config.snn_decay,
+            reset_mode=config.snn_reset_mode,
+            num_steps=config.snn_num_steps,
+            learnable_threshold=config.snn_learnable_threshold,
+            learnable_decay=config.snn_learnable_decay,
+            track_stats=config.snn_track_stats,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        kv_cache=None,
-        start_pos: int = 0,
-    ):
+    def forward(self, x, cos, sin, kv_cache=None, start_pos: int = 0):
         attn_out, new_kv = self.attn(self.ln1(x), cos, sin, kv_cache, start_pos)
         x = x + attn_out
         x = x + self.ffn(self.ln2(x))
