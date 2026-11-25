@@ -17,6 +17,7 @@ def generate(
     enc_name: str = "gpt2",
     device=None,
     use_cache: bool = True,
+    update_memory: bool = True,
 ) -> str:
     enc = tiktoken.get_encoding(enc_name)
     device = device or next(model.parameters()).device
@@ -27,6 +28,7 @@ def generate(
     ids = enc.encode_ordinary(prompt) if prompt else [enc.eot_token]
     idx = torch.tensor([ids], dtype=torch.long, device=device)
     out = model.generate(
-        idx, max_new_tokens, temperature, top_k, top_p, use_cache=use_cache
+        idx, max_new_tokens, temperature, top_k, top_p,
+        use_cache=use_cache, update_memory=update_memory,
     )
     return enc.decode(out[0].tolist())
