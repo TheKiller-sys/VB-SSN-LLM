@@ -150,19 +150,29 @@ class ReasoningGraph:
     # ------------------------------------------------------------- utilidades
     @staticmethod
     def _rule_key(a: str) -> str:
-        return a if isinstance(a, str) else "+".join(sorted(a))
+        """Clave canónica: strings multipalabra se ordenan e ignoran mayúsculas
+        para que "hello world" y "world hello" mapeen al mismo bucket.
+        Tuplas/sets conservan el comportamiento original."""
+        if isinstance(a, str):
+            return " ".join(sorted(a.lower().split()))
+        return "+".join(sorted(a))
 
-    def _same_consequent(self, a: str, b: str) -> bool:
-        if a == b:
-            return True
-        if isinstance(a, str) and isinstance(b, str):
-            return a.lower() == b.lower()
-        return False
+    def _same_consequent(self, a, b) -> bool:
+        return str(a).lower() == str(b).lower()
+
+    def lookup(self, antecedent: str) -> list[Rule]:
+        """Devuelve las reglas cuyo antecedente coincide (vía `_rule_key`)."""
+        key = self._rule_key(antecedent)
+        out: list[Rule] = []
+        for rid in self.by_antecedent.get(key, []):
+            r = self.rules.get(rid)
+            if r is not None:
+                out.append(r)
+        return out
 
     def _find_rule(self, a: str, c: str) -> Rule | None:
-        for rid in self.by_antecedent.get(self._rule_key(a), []):
-            r = self.rules.get(rid)
-            if r and self._same_consequent(r.consequent, c):
+        for r in self.lookup(a):
+            if self._same_consequent(r.consequent, c):
                 return r
         return None
 
@@ -181,8 +191,8 @@ class ReasoningGraph:
     def create_rule(
         self, antecedent: str, consequent: str, evidence: dict | None = None
     ) -> Rule | None:
-        self._step += 1
-
+        """Crea una regla. NO avanza el reloj: el cooldown sólo debe consumirse
+        con `tick()` o con `apply()`."""
         if self._is_tautology(antecedent, consequent):
             self.metrics["tautological_rejected"] += 1
             return None
@@ -194,7 +204,9 @@ class ReasoningGraph:
             return None
 
         if len(self.rules) >= MAX_RULES:
-            self.prune()
+            # Al alcanzar el tope hay que forzar prune, porque el trigger
+            # normal (1.2 × MAX_RULES) es inalcanzable cuando MAX_RULES es cap.
+            self.prune(force=True)
             if len(self.rules) >= MAX_RULES:
                 return None
 
@@ -222,9 +234,8 @@ class ReasoningGraph:
         seen: set[str] = set()
 
         for fact in facts:
-            for rid in self.by_antecedent.get(self._rule_key(fact), []):
-                rule = self.rules.get(rid)
-                if not rule or rule.confidence < MIN_RULE_CONFIDENCE:
+            for rule in self.lookup(fact):
+                if rule.confidence < MIN_RULE_CONFIDENCE:
                     continue
                 if rule.id in seen:
                     continue
