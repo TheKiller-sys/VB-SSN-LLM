@@ -8,7 +8,6 @@ import warnings
 
 
 def resolve_device(device: str | None = "auto"):
-    """Devuelve un `torch.device`. `auto` -> cuda > mps > cpu."""
     import torch
 
     if device is None or device == "auto":
@@ -34,6 +33,18 @@ class GPTConfig:
     dropout: float = 0.1
     tie_weights: bool = True
     init_std: float = 0.02
+
+    # ---- Resonant Tokenizer (v4.1) ----
+    use_rt: bool = False
+    rt_bpe_vocab_size: int = 40_000
+    rt_n_concepts: int = 12_092
+    rt_concept_dim: int = 132
+    rt_aux_loss_weight: float = 0.1
+    rt_bpe_path: str = "checkpoints/bpe_code.json"
+    rt_ema_decay: float = 0.99
+    rt_commitment_beta: float = 0.25
+    rt_min_count_for_update: float = 0.1
+    rt_concept_top_k_tokens: int = 8
 
     # ---- FFN de spikes ----
     use_spiking: bool = True
@@ -72,7 +83,7 @@ class GPTConfig:
 
     # ---- autoconocimiento (v4.0) ----
     self_knowledge_enabled: bool = True
-    self_knowledge_hidden: int = 0  # 0 = usar n_embd
+    self_knowledge_hidden: int = 0
     self_knowledge_loss_weight: float = 0.1
 
     # ---- razonador latente (v4.0) ----
@@ -111,10 +122,6 @@ class GPTConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
-    # En GPTConfig, dentro de la sección "---- sistema ----" o antes:
-    code_corpus: bool = False       # NUEVO: activa CodeCorpusObserver
-    split_by: str = "file"          # NUEVO: "file" | "repo"
-
     def validate(self) -> None:
         checks = [
             (self.vocab_size > 0, "vocab_size must be > 0"),
@@ -132,77 +139,76 @@ class GPTConfig:
             (self.batch_size > 0, "batch_size must be > 0"),
             (self.spiking_mult >= 1, "spiking_mult must be >= 1"),
             (self.spiking_alpha > 0, "spiking_alpha must be > 0"),
-            (
-                self.snn_mode in ("static", "multi_step", "temporal", "gelu"),
-                f"invalid snn_mode: {self.snn_mode}",
-            ),
-            (
-                self.snn_reset_mode in ("soft", "hard"),
-                f"invalid snn_reset_mode: {self.snn_reset_mode}",
-            ),
+            (self.snn_mode in ("static", "multi_step", "temporal", "gelu"),
+             f"invalid snn_mode: {self.snn_mode}"),
+            (self.snn_reset_mode in ("soft", "hard"),
+             f"invalid snn_reset_mode: {self.snn_reset_mode}"),
             (self.snn_num_steps >= 1, "snn_num_steps must be >= 1"),
             (0.0 < self.snn_decay < 1.0, "snn_decay must be in (0, 1)"),
-            # memoria neural
             (self.neural_memory_max_size > 0, "neural_memory_max_size must be > 0"),
             (self.neural_memory_k >= 1, "neural_memory_k must be >= 1"),
-            (
-                self.neural_memory_k <= self.neural_memory_max_size,
-                "neural_memory_k must be <= neural_memory_max_size",
-            ),
+            (self.neural_memory_k <= self.neural_memory_max_size,
+             "neural_memory_k must be <= neural_memory_max_size"),
             (self.neural_memory_hebbian_lr >= 0, "neural_memory_hebbian_lr must be >= 0"),
             (0.0 <= self.neural_memory_hebbian_decay <= 1.0,
              "neural_memory_hebbian_decay must be in [0, 1]"),
             (self.neural_memory_norm_clamp > 0, "neural_memory_norm_clamp must be > 0"),
             (self.neural_memory_append_batch_size > 0,
              "neural_memory_append_batch_size must be > 0"),
-            # abstracción
             (self.abstraction_n_codes >= 2, "abstraction_n_codes must be >= 2"),
             (0.0 <= self.abstraction_ema_decay < 1.0,
              "abstraction_ema_decay must be in [0, 1)"),
             (self.abstraction_loss_weight >= 0, "abstraction_loss_weight must be >= 0"),
             (self.abstraction_residual_scale >= 0, "abstraction_residual_scale must be >= 0"),
-            # autoconocimiento
             (self.self_knowledge_loss_weight >= 0,
              "self_knowledge_loss_weight must be >= 0"),
             (self.self_knowledge_hidden >= 0, "self_knowledge_hidden must be >= 0"),
-            # razonador
             (self.latent_reasoner_heads >= 1, "latent_reasoner_heads must be >= 1"),
             (self.n_embd % self.latent_reasoner_heads == 0,
              "n_embd must be divisible by latent_reasoner_heads"),
             (self.latent_reasoner_layers >= 1, "latent_reasoner_layers must be >= 1"),
-            # analyzer
             (self.analyzer_interval_s > 0, "analyzer_interval_s must be > 0"),
-            # Dentro de la lista `checks`:
-            (self.split_by in ("file", "repo"), f"invalid split_by: {self.split_by}"),
+            # RT
+            (self.rt_bpe_vocab_size >= 2, "rt_bpe_vocab_size must be >= 2"),
+            (self.rt_n_concepts >= 2, "rt_n_concepts must be >= 2"),
+            (self.rt_concept_dim > 0, "rt_concept_dim must be > 0"),
+            (self.rt_aux_loss_weight >= 0, "rt_aux_loss_weight must be >= 0"),
+            (0.0 <= self.rt_ema_decay < 1.0, "rt_ema_decay must be in [0, 1)"),
+            (self.rt_commitment_beta >= 0, "rt_commitment_beta must be >= 0"),
+            (self.rt_min_count_for_update >= 0, "rt_min_count_for_update must be >= 0"),
+            (self.rt_concept_top_k_tokens >= 1, "rt_concept_top_k_tokens must be >= 1"),
         ]
         for ok, msg in checks:
             if not ok:
                 raise ValueError(msg)
 
+        if self.use_rt and self.vocab_size != self.rt_bpe_vocab_size:
+            warnings.warn(
+                f"use_rt=True but vocab_size={self.vocab_size} != "
+                f"rt_bpe_vocab_size={self.rt_bpe_vocab_size}. "
+                f"Override vocab_size to rt_bpe_vocab_size if using RT.",
+                RuntimeWarning, stacklevel=3,
+            )
+
         if self.snn_mode == "temporal" and self.use_spiking:
             warnings.warn(
-                "snn_mode='temporal' uses BPTT over the full sequence: "
-                "slow and memory-heavy. Prefer 'multi_step' for production.",
-                RuntimeWarning,
-                stacklevel=3,
+                "snn_mode='temporal' uses BPTT over full sequence. Prefer 'multi_step'.",
+                RuntimeWarning, stacklevel=3,
             )
-
         if self.compile and self.neural_memory_enabled:
             warnings.warn(
-                "torch.compile + neural_memory may cause graph breaks or "
-                "buffer-mutation issues. Consider disabling compile if you "
-                "observe failures.",
-                RuntimeWarning,
-                stacklevel=3,
+                "torch.compile + neural_memory may cause graph breaks.",
+                RuntimeWarning, stacklevel=3,
             )
-
+        if self.compile and self.use_rt:
+            warnings.warn(
+                "torch.compile + use_rt may cause graph breaks (VQ quantization).",
+                RuntimeWarning, stacklevel=3,
+            )
         if self.temporal_mode_uses_memory():
             warnings.warn(
-                "snn_mode='temporal' + neural_memory_enabled: memory update "
-                "happens once per forward over the whole sequence, which may "
-                "dominate runtime. Consider snn_mode='multi_step'.",
-                RuntimeWarning,
-                stacklevel=3,
+                "snn_mode='temporal' + neural_memory_enabled: slow.",
+                RuntimeWarning, stacklevel=3,
             )
 
     def temporal_mode_uses_memory(self) -> bool:
@@ -229,8 +235,6 @@ SIZE_MEDIUM = dict(n_layer=12, n_head=12, n_embd=768)
 SIZE_LARGE = dict(n_layer=24, n_head=16, n_embd=1024)
 
 SIZES = {
-    "tiny": SIZE_TINY,
-    "small": SIZE_SMALL,
-    "medium": SIZE_MEDIUM,
-    "large": SIZE_LARGE,
+    "tiny": SIZE_TINY, "small": SIZE_SMALL,
+    "medium": SIZE_MEDIUM, "large": SIZE_LARGE,
 }
