@@ -75,6 +75,7 @@ class ConsistencyVerifier:
         severity_floor: float = 0.65,
         oov_ratio_threshold: float = 0.3,
         repetition_threshold: float = 0.5,
+        rule_confidence_threshold: float = 0.6,
     ):
         self.calm_threshold = calm_threshold
         self.confidence_threshold = confidence_threshold
@@ -82,6 +83,9 @@ class ConsistencyVerifier:
         self.severity_floor = severity_floor
         self.oov_ratio_threshold = oov_ratio_threshold
         self.repetition_threshold = repetition_threshold
+        # Umbral propio del verificador (más estricto que MIN_RULE_CONFIDENCE
+        # del grafo). Configurable para mantener intención explícita.
+        self.rule_confidence_threshold = rule_confidence_threshold
         self.metrics = {"checks": 0, "problems": 0}
 
     # ------------------------------------------------------------- señales
@@ -205,7 +209,7 @@ class ConsistencyVerifier:
             expected = self._top_consequent_for(a, graph)
             if expected and expected != b:
                 rule = graph._find_rule(a, expected)
-                if rule and rule.confidence > 0.7:
+                if rule and rule.confidence >= self.rule_confidence_threshold:
                     problems.append(Problem(
                         type="inconsistent_with_corpus",
                         severity=0.6,
@@ -238,16 +242,15 @@ class ConsistencyVerifier:
         self.metrics["problems"] += len(problems)
         return problems
 
-    @staticmethod
-    def _top_consequent_for(antecedent: str, graph) -> str | None:
+    def _top_consequent_for(self, antecedent: str, graph) -> str | None:
+        """Mejor consecuente para `antecedent` (vía `graph.lookup`)."""
         best = None
         best_conf = 0.0
-        for rid in graph.by_antecedent.get(antecedent, []):
-            r = graph.rules.get(rid)
-            if r and r.confidence > best_conf:
+        for r in graph.lookup(antecedent):
+            if r.confidence > best_conf:
                 best_conf = r.confidence
                 best = r.consequent
-        return best if best_conf > 0.6 else None
+        return best if best_conf >= self.rule_confidence_threshold else None
 
     # ------------------------------------------------------------- verdict
     def verdict(self, problems: list[Problem]) -> str:
