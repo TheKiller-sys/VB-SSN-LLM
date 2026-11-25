@@ -14,8 +14,8 @@ import tempfile
 
 from snn_lm_v3 import (
     GPTConfig, SIZES, SNNLM, make_dataloader, train, evaluate, generate,
-    resolve_device, load_texts,
-    CorpusObserver, ReasoningGraph, ConsistencyVerifier, save_graph,
+    resolve_device,
+    CorpusObserver, ReasoningGraph, ConsistencyVerifier,
 )
 
 DEMO = """The quick brown fox jumps over the lazy dog.
