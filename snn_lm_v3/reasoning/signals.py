@@ -16,6 +16,8 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn.functional as F
 
+from ..rope import apply_rope
+
 
 @dataclass
 class InternalSignals:
@@ -71,22 +73,27 @@ class SignalProbe:
             ids = [enc.eot_token, enc.eot_token]
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
 
-        logits, _ = self.model(idx)
+        # Un único forward: suficiente para entropy, max_prob y perplexity
+        # shifted. Además, NO contamina la memoria del modelo.
+        logits, _ = self.model(idx, update_memory=False)
+
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
 
         output_entropy = -(probs * log_probs).sum(-1).mean().item()
         max_prob = probs.max(-1).values.mean().item()
 
-        # Perplejidad del texto dado (shifted)
-        targets = idx[:, 1:].contiguous()
-        inputs = idx[:, :-1].contiguous()
-        logits_ppl, _ = self.model(inputs)
-        loss = F.cross_entropy(
-            logits_ppl.reshape(-1, logits_ppl.size(-1)),
-            targets.reshape(-1),
-        )
-        perplexity = float(torch.exp(loss.clamp(max=20.0)).item())
+        # Perplejidad shifted sobre el mismo forward
+        if logits.size(1) >= 2:
+            shifted_logits = logits[:, :-1].contiguous()
+            targets = idx[:, 1:].contiguous()
+            loss = F.cross_entropy(
+                shifted_logits.reshape(-1, shifted_logits.size(-1)),
+                targets.reshape(-1),
+            )
+            perplexity = float(torch.exp(loss.clamp(max=20.0)).item())
+        else:
+            perplexity = float("inf")
 
         # Firing rates
         rates = []
@@ -124,7 +131,8 @@ class SignalProbe:
             return 0.0
 
     def _attention_entropy(self, idx) -> float:
-        """Entropía de atención de la capa 0, recomputada en modo inspección."""
+        """Entropía de atención de la capa 0 recomputada con RoPE aplicado,
+        de modo que coincida con la atención real del modelo."""
         try:
             block = self.model.blocks[0]
             x = self.model.drop(self.model.tok_emb(idx))
@@ -135,6 +143,10 @@ class SignalProbe:
             D = block.attn.head_dim
             q = q.view(B, T, H, D).transpose(1, 2)
             k = k.view(B, T, H, D).transpose(1, 2)
+            # RoPE igual que en MultiHeadAttention
+            cos = self.model.rope_cos[:T].unsqueeze(0).unsqueeze(0)
+            sin = self.model.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+            q, k = apply_rope(q, k, cos, sin)
             att = (q @ k.transpose(-2, -1)) / (D ** 0.5)
             mask = torch.triu(
                 torch.ones(T, T, dtype=torch.bool, device=idx.device), diagonal=1
