@@ -24,9 +24,14 @@ def test_generate_empty_prompt_returns_str(gpt2_enc):
 
 
 def test_generate_with_seed_is_reproducible(gpt2_enc):
+    """Determinismo con memoria desactivada (evita side-effects entre llamadas)."""
     model = SNNLM(_cfg())
-    out1 = generate(model, prompt="hello", max_new_tokens=5, seed=42)
-    out2 = generate(model, prompt="hello", max_new_tokens=5, seed=42)
+    out1 = generate(
+        model, prompt="hello", max_new_tokens=5, seed=42, update_memory=False,
+    )
+    out2 = generate(
+        model, prompt="hello", max_new_tokens=5, seed=42, update_memory=False,
+    )
     assert out1 == out2
 
 
