@@ -1,4 +1,5 @@
-"""Bucle de entrenamiento con resume, grad-accum, AMP, eval y análisis continuo."""
+"""Bucle de entrenamiento con resume, grad-accum, AMP, eval,
+análisis continuo y monitorización de codebooks."""
 from __future__ import annotations
 
 import math
@@ -8,9 +9,17 @@ from contextlib import nullcontext
 
 import torch
 
-from .checkpoint import save_checkpoint, _unwrap
+from .checkpoint import save_checkpoint
 from .config import resolve_device
 from .analyzer import ContinuousAnalyzer
+
+
+def _unwrap(model):
+    seen = set()
+    while hasattr(model, "_orig_mod") and id(model) not in seen:
+        seen.add(id(model))
+        model = model._orig_mod
+    return model
 
 
 def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> float:
@@ -21,6 +30,42 @@ def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> fl
     progress = min((step - warmup) / (total - warmup), 1.0)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_ratio + (1.0 - min_ratio) * cosine
+
+
+def _codebook_stats(unwrapped) -> str:
+    """Devuelve string con uso de codebooks (RT + abstraction)."""
+    parts = []
+    # RT
+    rv = getattr(unwrapped, "rv", None)
+    if rv is not None:
+        try:
+            used = int((rv.ema_counts > rv.cfg.min_count_for_update).sum().item())
+            total = rv.cfg.n_concepts
+            pct = 100.0 * used / max(total, 1)
+            parts.append(f"rt_cb={used}/{total}({pct:.1f}%)")
+        except Exception:
+            pass
+    # AbstractionHead
+    abs_head = getattr(unwrapped, "abstraction_head", None)
+    if abs_head is not None:
+        try:
+            used = int((abs_head.ema_counts > 0.01).sum().item())
+            total = abs_head.n_codes
+            pct = 100.0 * used / max(total, 1)
+            parts.append(f"abs_cb={used}/{total}({pct:.1f}%)")
+        except Exception:
+            pass
+    return " ".join(parts)
+
+
+def _memory_stats(unwrapped) -> str:
+    mem = getattr(unwrapped, "neural_memory", None)
+    if mem is None:
+        return ""
+    try:
+        return f"mem={int(mem.size.item())}/{mem.max_size}"
+    except Exception:
+        return ""
 
 
 @torch.no_grad()
@@ -139,13 +184,8 @@ def train(
 
     def _save(tag: str) -> None:
         save_checkpoint(
-            model,
-            optimizer,
-            scheduler,
-            config,
-            step,
-            os.path.join(config.out_dir, tag),
-            best_val_loss,
+            model, optimizer, scheduler, config, step,
+            os.path.join(config.out_dir, tag), best_val_loss,
         )
 
     try:
@@ -180,20 +220,28 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
+                # ── LOGGING con codebook + memoria ──
                 if config.log_every > 0 and step % config.log_every == 0 and logger:
                     lr = scheduler.get_last_lr()[0]
+                    cb = _codebook_stats(_unwrap(model))
+                    mem = _memory_stats(_unwrap(model))
+                    extra = " ".join(p for p in (cb, mem) if p)
                     logger.info(
                         f"step={step} loss={loss.item():.4f} "
                         f"ppl={math.exp(min(loss.item(), 20)):.2f} "
-                        f"lr={lr:.2e} t={time.time() - t0:.0f}s"
+                        f"lr={lr:.2e}"
+                        + (f" {extra}" if extra else "")
+                        + f" t={time.time() - t0:.0f}s"
                     )
 
                 if config.eval_every > 0 and step > 0 and step % config.eval_every == 0:
                     metrics = evaluate(model, val_dl, device, config.eval_batches)
                     if logger:
+                        cb = _codebook_stats(_unwrap(model))
                         logger.info(
                             f"[eval] step={step} loss={metrics['loss']:.4f} "
                             f"ppl={metrics['ppl']:.2f} n={metrics['n']}"
+                            + (f" {cb}" if cb else "")
                         )
                     if metrics["loss"] < best_val_loss:
                         best_val_loss = metrics["loss"]
