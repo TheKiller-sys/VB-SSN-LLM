@@ -141,6 +141,10 @@ class GPTConfig:
             # memoria neural
             (self.neural_memory_max_size > 0, "neural_memory_max_size must be > 0"),
             (self.neural_memory_k >= 1, "neural_memory_k must be >= 1"),
+            (
+                self.neural_memory_k <= self.neural_memory_max_size,
+                "neural_memory_k must be <= neural_memory_max_size",
+            ),
             (self.neural_memory_hebbian_lr >= 0, "neural_memory_hebbian_lr must be >= 0"),
             (0.0 <= self.neural_memory_hebbian_decay <= 1.0,
              "neural_memory_hebbian_decay must be in [0, 1]"),
