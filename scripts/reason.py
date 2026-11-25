@@ -16,8 +16,8 @@ from snn_lm_v3 import (
     CorpusObserver,
     ReasoningGraph,
     save_graph,
+    load_graph,
 )
-from snn_lm_v3.reasoning import load_graph
 
 
 def parse_args():
