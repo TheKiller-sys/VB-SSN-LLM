@@ -1,4 +1,4 @@
-"""Bucle de entrenamiento con resume, grad-accum, AMP y eval."""
+"""Bucle de entrenamiento con resume, grad-accum, AMP, eval y análisis continuo."""
 from __future__ import annotations
 
 import math
@@ -10,6 +10,7 @@ import torch
 
 from .checkpoint import save_checkpoint, _unwrap
 from .config import resolve_device
+from .analyzer import ContinuousAnalyzer
 
 
 def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> float:
@@ -115,11 +116,25 @@ def train(
     if best_val_loss is None:
         best_val_loss = float("inf")
 
+    # ---- ContinuousAnalyzer ----
+    analyzer: ContinuousAnalyzer | None = None
+    unwrapped = _unwrap(model)
+    if config.analyzer_enabled:
+        analyzer = ContinuousAnalyzer(
+            unwrapped,
+            interval_s=config.analyzer_interval_s,
+            prune_memory=config.analyzer_prune_memory,
+            refresh_codebook=config.analyzer_refresh_codebook,
+        )
+        analyzer.start()
+        if logger:
+            logger.info("ContinuousAnalyzer iniciado en background")
+
     if logger:
         logger.info(
             f"Entrenando: device={device} amp={use_amp} accum={accum} "
             f"start_step={start_step} max_steps={config.max_steps} "
-            f"params={sum(p.numel() for p in _unwrap(model).parameters()):,}"
+            f"params={sum(p.numel() for p in unwrapped.parameters()):,}"
         )
 
     def _save(tag: str) -> None:
@@ -133,70 +148,74 @@ def train(
             best_val_loss,
         )
 
-    while step < config.max_steps:
-        for x, y in train_dl:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+    try:
+        while step < config.max_steps:
+            for x, y in train_dl:
+                x = x.to(device, non_blocking=True)
+                y = y.to(device, non_blocking=True)
 
-            with autocast_ctx:
-                _, loss = model(x, y)
-                loss_scaled = loss / accum
+                with autocast_ctx:
+                    _, loss = model(x, y)
+                    loss_scaled = loss / accum
 
-            if scaler is not None:
-                scaler.scale(loss_scaled).backward()
-            else:
-                loss_scaled.backward()
+                if scaler is not None:
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
 
-            micro_step += 1
-            if micro_step % accum != 0:
-                continue
+                micro_step += 1
+                if micro_step % accum != 0:
+                    continue
 
-            if scaler is not None:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                _unwrap(model).parameters(), config.grad_clip
-            )
-            if scaler is not None:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
-
-            if config.log_every > 0 and step % config.log_every == 0 and logger:
-                lr = scheduler.get_last_lr()[0]
-                logger.info(
-                    f"step={step} loss={loss.item():.4f} "
-                    f"ppl={math.exp(min(loss.item(), 20)):.2f} "
-                    f"lr={lr:.2e} t={time.time() - t0:.0f}s"
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    _unwrap(model).parameters(), config.grad_clip
                 )
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
 
-            if config.eval_every > 0 and step > 0 and step % config.eval_every == 0:
-                metrics = evaluate(model, val_dl, device, config.eval_batches)
-                if logger:
+                if config.log_every > 0 and step % config.log_every == 0 and logger:
+                    lr = scheduler.get_last_lr()[0]
                     logger.info(
-                        f"[eval] step={step} loss={metrics['loss']:.4f} "
-                        f"ppl={metrics['ppl']:.2f} n={metrics['n']}"
+                        f"step={step} loss={loss.item():.4f} "
+                        f"ppl={math.exp(min(loss.item(), 20)):.2f} "
+                        f"lr={lr:.2e} t={time.time() - t0:.0f}s"
                     )
-                if metrics["loss"] < best_val_loss:
-                    best_val_loss = metrics["loss"]
-                    _save("best.pt")
+
+                if config.eval_every > 0 and step > 0 and step % config.eval_every == 0:
+                    metrics = evaluate(model, val_dl, device, config.eval_batches)
                     if logger:
                         logger.info(
-                            f"[ckpt] best.pt guardado (val_loss={best_val_loss:.4f})"
+                            f"[eval] step={step} loss={metrics['loss']:.4f} "
+                            f"ppl={metrics['ppl']:.2f} n={metrics['n']}"
                         )
-                model.train()
+                    if metrics["loss"] < best_val_loss:
+                        best_val_loss = metrics["loss"]
+                        _save("best.pt")
+                        if logger:
+                            logger.info(
+                                f"[ckpt] best.pt guardado (val_loss={best_val_loss:.4f})"
+                            )
+                    model.train()
 
-            if config.ckpt_every > 0 and step > 0 and step % config.ckpt_every == 0:
-                _save(f"step_{step}.pt")
-                _save("latest.pt")
-                if logger:
-                    logger.info(f"[ckpt] step={step} guardado")
+                if config.ckpt_every > 0 and step > 0 and step % config.ckpt_every == 0:
+                    _save(f"step_{step}.pt")
+                    _save("latest.pt")
+                    if logger:
+                        logger.info(f"[ckpt] step={step} guardado")
 
-            step += 1
-            if step >= config.max_steps:
-                break
+                step += 1
+                if step >= config.max_steps:
+                    break
+    finally:
+        if analyzer is not None:
+            analyzer.stop()
 
     _save("final.pt")
     if logger:
