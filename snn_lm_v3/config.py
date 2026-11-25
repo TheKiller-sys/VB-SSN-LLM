@@ -111,6 +111,10 @@ class GPTConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
+    # En GPTConfig, dentro de la sección "---- sistema ----" o antes:
+    code_corpus: bool = False       # NUEVO: activa CodeCorpusObserver
+    split_by: str = "file"          # NUEVO: "file" | "repo"
+
     def validate(self) -> None:
         checks = [
             (self.vocab_size > 0, "vocab_size must be > 0"),
@@ -168,6 +172,8 @@ class GPTConfig:
             (self.latent_reasoner_layers >= 1, "latent_reasoner_layers must be >= 1"),
             # analyzer
             (self.analyzer_interval_s > 0, "analyzer_interval_s must be > 0"),
+            # Dentro de la lista `checks`:
+            (self.split_by in ("file", "repo"), f"invalid split_by: {self.split_by}"),
         ]
         for ok, msg in checks:
             if not ok:
