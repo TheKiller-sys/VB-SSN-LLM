@@ -7,7 +7,7 @@ import os
 import numpy as np
 import torch
 
-CKPT_VERSION = 2
+CKPT_VERSION = 3
 
 
 def _unwrap(model):
@@ -24,14 +24,21 @@ def save_checkpoint(
     best_val_loss: float | None = None,
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    unwrapped = _unwrap(model)
+
+    memory_state = None
+    if hasattr(unwrapped, "memory_state_for_checkpoint"):
+        memory_state = unwrapped.memory_state_for_checkpoint()
+
     payload = {
         "version": CKPT_VERSION,
-        "model": _unwrap(model).state_dict(),
+        "model": unwrapped.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "config": config.__dict__,
         "step": step,
         "best_val_loss": best_val_loss,
+        "memory_state": memory_state,
         "rng_state": {
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all()
@@ -62,8 +69,12 @@ def load_checkpoint(
         **{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__}
     )
     model = model_class(cfg)
-    model.load_state_dict(ckpt["model"])
+    model.load_state_dict(ckpt["model"], strict=False)
     model.to(device)
+
+    if "memory_state" in ckpt and ckpt["memory_state"] is not None:
+        if hasattr(model, "load_memory_state_from_checkpoint"):
+            model.load_memory_state_from_checkpoint(ckpt["memory_state"], device)
 
     result = {
         "model": model,
