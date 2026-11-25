@@ -1,4 +1,4 @@
-"""Guardado y carga de checkpoints con versionado y resume completo."""
+"""Guardado y carga de checkpoints con soporte RT."""
 from __future__ import annotations
 
 import logging
@@ -7,11 +7,21 @@ import os
 import numpy as np
 import torch
 
-CKPT_VERSION = 3
+CKPT_VERSION = 4  # bumped: now RT-aware
 
 
 def _unwrap(model):
-    return getattr(model, "_orig_mod", model)
+    while hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
+
+
+def _is_rt(model) -> bool:
+    try:
+        from .tokenizer import RTModelWrapper
+        return isinstance(model, RTModelWrapper)
+    except ImportError:
+        return False
 
 
 def save_checkpoint(
@@ -30,6 +40,8 @@ def save_checkpoint(
     if hasattr(unwrapped, "memory_state_for_checkpoint"):
         memory_state = unwrapped.memory_state_for_checkpoint()
 
+    is_rt = _is_rt(unwrapped)
+
     payload = {
         "version": CKPT_VERSION,
         "model": unwrapped.state_dict(),
@@ -39,37 +51,59 @@ def save_checkpoint(
         "step": step,
         "best_val_loss": best_val_loss,
         "memory_state": memory_state,
+        "use_rt": is_rt,
         "rng_state": {
             "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all()
-            if torch.cuda.is_available()
-            else None,
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "numpy": np.random.get_state(),
         },
     }
+    if is_rt:
+        payload["rt_config"] = dict(unwrapped.rv.cfg.__dict__)
+        payload["bpe_path"] = getattr(config, "rt_bpe_path", None)
+
     tmp = path + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, path)
 
 
-def load_checkpoint(
-    path: str, model_class, device="cpu", load_optimizer: bool = False
-) -> dict:
+def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool = False) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     version = ckpt.get("version", 0)
     if version != CKPT_VERSION:
-        logging.warning(
-            f"Checkpoint version {version} != {CKPT_VERSION}. May be incompatible."
-        )
+        logging.warning(f"Checkpoint version {version} != {CKPT_VERSION}. May be incompatible.")
 
     from .config import GPTConfig
-
     raw = ckpt["config"]
-    cfg = GPTConfig(
-        **{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__}
-    )
-    model = model_class(cfg)
-    model.load_state_dict(ckpt["model"], strict=False)
+    cfg = GPTConfig(**{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__})
+
+    # Validate vocab
+    ckpt_vocab = raw.get("vocab_size")
+    if ckpt_vocab is not None:
+        model_vocab = ckpt["model"]["tok_emb.weight"].shape[0]
+        if ckpt_vocab != model_vocab:
+            raise ValueError(f"Checkpoint vocab {ckpt_vocab} != tok_emb shape {model_vocab}")
+
+    use_rt = ckpt.get("use_rt", False)
+
+    if use_rt:
+        from .tokenizer import ResonantVocab, RVConfig, RTModelWrapper
+        rv_data = ckpt.get("rt_config") or {}
+        rv_cfg = RVConfig(**{k: v for k, v in rv_data.items() if k in RVConfig.__dataclass_fields__})
+        bpe_path = ckpt.get("bpe_path")
+        if not bpe_path or not os.path.exists(bpe_path):
+            raise ValueError(
+                f"RT checkpoint requires existing bpe_path. Got: {bpe_path!r}. "
+                f"Restore the BPE file or set config.rt_bpe_path."
+            )
+        rv = ResonantVocab.from_bpe(bpe_path, rv_cfg)
+        snnlm = model_class(cfg)
+        model = RTModelWrapper(snnlm, rv, aux_loss_weight=cfg.rt_aux_loss_weight)
+        model.load_state_dict(ckpt["model"], strict=False)
+    else:
+        model = model_class(cfg)
+        model.load_state_dict(ckpt["model"], strict=False)
+
     model.to(device)
 
     if "memory_state" in ckpt and ckpt["memory_state"] is not None:
@@ -81,6 +115,7 @@ def load_checkpoint(
         "config": cfg,
         "step": ckpt.get("step", 0),
         "best_val_loss": ckpt.get("best_val_loss"),
+        "use_rt": use_rt,
     }
 
     if load_optimizer:
