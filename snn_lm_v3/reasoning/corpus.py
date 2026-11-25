@@ -54,6 +54,8 @@ MAX_STATE_LOG = 1000
 MAX_SEQUENCE_LEN = 50
 MAX_TRANSITIONS = 50000
 MAX_DELAYS_PER_TRANSITION = 100
+# Cota por token para evitar O(n²) en `_min_delay`
+MAX_POSITIONS_PER_TOKEN = 50
 
 
 @dataclass
@@ -81,6 +83,10 @@ class Transition:
     @property
     def mean_delay(self) -> float:
         return sum(self.delays) / len(self.delays) if self.delays else 0.0
+
+
+# Token de "palabra": letras Unicode de longitud >= 3 (sin dígitos ni _).
+_WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 
 class CorpusObserver:
@@ -119,7 +125,7 @@ class CorpusObserver:
         """Tokeniza a palabras significativas (sin stopwords, min length)."""
         if not text:
             return []
-        raw = re.findall(r"[a-záéíóúñü]{3,}", text.lower())
+        raw = _WORD_RE.findall(text.lower())
         return [t for t in raw if t not in STOPWORDS and len(t) >= MIN_TOKEN_LEN]
 
     # ---------------------------------------------------------- observación
@@ -169,11 +175,14 @@ class CorpusObserver:
     def _record_transitions(self, text: str, tokens: list[str]) -> None:
         """Cuenta pares (A→B) con delay entre ocurrencias en el texto."""
         positions: dict[str, list[int]] = defaultdict(list)
-        for m in re.finditer(r"[a-záéíóúñü]{3,}", text.lower()):
+        for m in _WORD_RE.finditer(text.lower()):
             tok = m.group()
             if tok in STOPWORDS or len(tok) < MIN_TOKEN_LEN:
                 continue
-            positions[tok].append(m.start())
+            lst = positions[tok]
+            # Cota por token para mantener `_min_delay` acotado.
+            if len(lst) < MAX_POSITIONS_PER_TOKEN:
+                lst.append(m.start())
 
         seen_pairs: set[tuple[str, str]] = set()
         for i, a in enumerate(tokens):
