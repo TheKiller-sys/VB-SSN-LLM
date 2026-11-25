@@ -43,13 +43,48 @@ class GPTConfig:
     spiking_residual: bool = True
 
     # ---- dinámica LIF ----
-    snn_mode: str = "multi_step"          # static | multi_step | temporal | gelu
+    snn_mode: str = "multi_step"
     snn_num_steps: int = 4
     snn_decay: float = 0.9
-    snn_reset_mode: str = "soft"          # soft | hard
+    snn_reset_mode: str = "soft"
     snn_learnable_threshold: bool = False
     snn_learnable_decay: bool = False
     snn_track_stats: bool = False
+
+    # ---- memoria neural (v4.0) ----
+    neural_memory_enabled: bool = True
+    neural_memory_max_size: int = 10_000
+    neural_memory_k: int = 8
+    neural_memory_hebbian_lr: float = 1e-3
+    neural_memory_hebbian_decay: float = 0.999
+    neural_memory_norm_clamp: float = 100.0
+    neural_memory_use_fast_weights: bool = True
+    neural_memory_use_knn: bool = True
+    neural_memory_append_batch_size: int = 4096
+
+    # ---- abstracción geométrica (v4.0) ----
+    abstraction_enabled: bool = True
+    abstraction_n_codes: int = 256
+    abstraction_ema_decay: float = 0.99
+    abstraction_min_count_for_update: float = 0.1
+    abstraction_loss_weight: float = 0.05
+    abstraction_residual_scale: float = 1.0
+
+    # ---- autoconocimiento (v4.0) ----
+    self_knowledge_enabled: bool = True
+    self_knowledge_hidden: int = 0  # 0 = usar n_embd
+    self_knowledge_loss_weight: float = 0.1
+
+    # ---- razonador latente (v4.0) ----
+    latent_reasoner_enabled: bool = False
+    latent_reasoner_heads: int = 4
+    latent_reasoner_layers: int = 2
+
+    # ---- analizador en background (v4.0) ----
+    analyzer_enabled: bool = False
+    analyzer_interval_s: float = 60.0
+    analyzer_prune_memory: bool = True
+    analyzer_refresh_codebook: bool = True
 
     # ---- entrenamiento ----
     batch_size: int = 8
@@ -103,6 +138,32 @@ class GPTConfig:
             ),
             (self.snn_num_steps >= 1, "snn_num_steps must be >= 1"),
             (0.0 < self.snn_decay < 1.0, "snn_decay must be in (0, 1)"),
+            # memoria neural
+            (self.neural_memory_max_size > 0, "neural_memory_max_size must be > 0"),
+            (self.neural_memory_k >= 1, "neural_memory_k must be >= 1"),
+            (self.neural_memory_hebbian_lr >= 0, "neural_memory_hebbian_lr must be >= 0"),
+            (0.0 <= self.neural_memory_hebbian_decay <= 1.0,
+             "neural_memory_hebbian_decay must be in [0, 1]"),
+            (self.neural_memory_norm_clamp > 0, "neural_memory_norm_clamp must be > 0"),
+            (self.neural_memory_append_batch_size > 0,
+             "neural_memory_append_batch_size must be > 0"),
+            # abstracción
+            (self.abstraction_n_codes >= 2, "abstraction_n_codes must be >= 2"),
+            (0.0 <= self.abstraction_ema_decay < 1.0,
+             "abstraction_ema_decay must be in [0, 1)"),
+            (self.abstraction_loss_weight >= 0, "abstraction_loss_weight must be >= 0"),
+            (self.abstraction_residual_scale >= 0, "abstraction_residual_scale must be >= 0"),
+            # autoconocimiento
+            (self.self_knowledge_loss_weight >= 0,
+             "self_knowledge_loss_weight must be >= 0"),
+            (self.self_knowledge_hidden >= 0, "self_knowledge_hidden must be >= 0"),
+            # razonador
+            (self.latent_reasoner_heads >= 1, "latent_reasoner_heads must be >= 1"),
+            (self.n_embd % self.latent_reasoner_heads == 0,
+             "n_embd must be divisible by latent_reasoner_heads"),
+            (self.latent_reasoner_layers >= 1, "latent_reasoner_layers must be >= 1"),
+            # analyzer
+            (self.analyzer_interval_s > 0, "analyzer_interval_s must be > 0"),
         ]
         for ok, msg in checks:
             if not ok:
@@ -115,6 +176,27 @@ class GPTConfig:
                 RuntimeWarning,
                 stacklevel=3,
             )
+
+        if self.compile and self.neural_memory_enabled:
+            warnings.warn(
+                "torch.compile + neural_memory may cause graph breaks or "
+                "buffer-mutation issues. Consider disabling compile if you "
+                "observe failures.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+        if self.temporal_mode_uses_memory():
+            warnings.warn(
+                "snn_mode='temporal' + neural_memory_enabled: memory update "
+                "happens once per forward over the whole sequence, which may "
+                "dominate runtime. Consider snn_mode='multi_step'.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+    def temporal_mode_uses_memory(self) -> bool:
+        return self.snn_mode == "temporal" and self.neural_memory_enabled
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
