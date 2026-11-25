@@ -1,27 +1,32 @@
-"""Entrena SNN-LM v3.1 sobre archivos .txt con razonamiento simbólico opcional.
+"""Entrena SNN-LM v3.2 sobre archivos .txt con razonamiento simbólico opcional.
 
 Ejemplos:
-    python scripts/train.py data/ --size tiny
-    python scripts/train.py data/ --size medium --device cuda
-    python scripts/train.py data/ --config my_config.json --resume checkpoints/latest.pt
-    python scripts/train.py data/ --size tiny --max-steps 500 --no-reasoning
+    snnlm-train data/ --size tiny
+    snnlm-train data/ --size medium --device cuda
+    snnlm-train data/ --config my_config.json --resume checkpoints/latest.pt
+    snnlm-train data/ --size tiny --max-steps 500 --no-reasoning
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
 
 from snn_lm_v3 import (
-    GPTConfig, SIZES, SNNLM, make_dataloader, train, resolve_device,
+    GPTConfig,
+    SIZES,
+    SNNLM,
+    make_dataloader,
+    train,
+    resolve_device,
     load_texts,
-    CorpusObserver, ReasoningGraph, ConsistencyVerifier, Verdict,
+    CorpusObserver,
+    ReasoningGraph,
+    ConsistencyVerifier,
     save_graph,
+    generate,
 )
 from snn_lm_v3.checkpoint import load_checkpoint
 
@@ -210,7 +215,6 @@ def main():
 
     # ---------------- verificación final contra corpus ----------------
     if graph is not None and observer is not None:
-        from snn_lm_v3 import generate
         logger.info("Verificación final contra corpus...")
         text = generate(
             model,
