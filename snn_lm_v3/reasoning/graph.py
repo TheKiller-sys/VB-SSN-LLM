@@ -118,6 +118,7 @@ class ReasoningGraph:
     Uso:
         graph = ReasoningGraph()
         n = graph.mine_from_corpus(observer)
+        graph.tick()
         consequences = graph.apply(facts)
     """
 
@@ -138,6 +139,13 @@ class ReasoningGraph:
             "blocked_by_cooldown": 0,
             "facts_observed": 0,
         }
+
+    # ------------------------------------------------------------- reloj
+    def tick(self, n: int = 1) -> None:
+        """Avanza el reloj interno del grafo (para cooldown)."""
+        if n < 0:
+            raise ValueError("tick n must be >= 0")
+        self._step += int(n)
 
     # ------------------------------------------------------------- utilidades
     @staticmethod
@@ -296,6 +304,11 @@ class ReasoningGraph:
             return 0
 
         keep_n = int(MAX_RULES * RULE_PRUNE_KEEP_RATIO)
+        # Si se fuerza el prune en un grafo más pequeño que keep_n, reducir
+        # el objetivo a una fracción del tamaño actual para que pode de verdad.
+        if force and len(self.rules) <= keep_n:
+            keep_n = max(1, int(len(self.rules) * RULE_PRUNE_KEEP_RATIO))
+
         now = time.time()
 
         scored = []
