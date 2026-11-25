@@ -63,16 +63,24 @@ def test_generate_greedy():
 
 
 def test_generate_cache_equivalence():
-    """Cache y no-cache DEBEN producir la misma secuencia."""
+    """Cache y no-cache DEBEN producir la misma secuencia.
+
+    Se desactiva `update_memory` para que el estado de memoria no varíe
+    entre las dos llamadas y enmascare la diferencia de cache.
+    """
     model = SNNLM(_cfg())
     model.eval()
     idx = torch.randint(0, 100, (1, 5))
 
     torch.manual_seed(123)
-    out_cached = model.generate(idx.clone(), 10, temperature=1.0, use_cache=True)
+    out_cached = model.generate(
+        idx.clone(), 10, temperature=1.0, use_cache=True, update_memory=False,
+    )
 
     torch.manual_seed(123)
-    out_no_cache = model.generate(idx.clone(), 10, temperature=1.0, use_cache=False)
+    out_no_cache = model.generate(
+        idx.clone(), 10, temperature=1.0, use_cache=False, update_memory=False,
+    )
 
     assert torch.equal(out_cached, out_no_cache)
 
