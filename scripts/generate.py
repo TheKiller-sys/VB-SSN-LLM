@@ -1,21 +1,23 @@
 """Genera texto desde un checkpoint con verificación opcional contra corpus.
 
 Ejemplos:
-    python scripts/generate.py --ckpt checkpoints/best.pt --prompt "Once upon a time"
-    python scripts/generate.py --ckpt checkpoints/best.pt --prompt "Once" --corpus data/
+    snnlm-generate --ckpt checkpoints/best.pt --prompt "Once upon a time"
+    snnlm-generate --ckpt checkpoints/best.pt --prompt "Once" --corpus data/ --verify
 """
 from __future__ import annotations
 
 import argparse
 import logging
 import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from snn_lm_v3 import (
-    SNNLM, generate, resolve_device, load_texts,
-    CorpusObserver, ReasoningGraph, ConsistencyVerifier,
+    SNNLM,
+    generate,
+    resolve_device,
+    load_texts,
+    CorpusObserver,
+    ReasoningGraph,
+    ConsistencyVerifier,
     SignalProbe,
 )
 from snn_lm_v3.checkpoint import load_checkpoint
@@ -65,9 +67,10 @@ def main():
     args = parse_args()
 
     logging.basicConfig(
-        level=logging.INFO, format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S"
+        level=logging.INFO,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%H:%M:%S",
     )
-    logger = logging.getLogger("generate")
 
     device = resolve_device(args.device)
     ckpt = load_checkpoint(args.ckpt, SNNLM, device)
