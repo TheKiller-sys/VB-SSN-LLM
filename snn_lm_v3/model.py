@@ -128,13 +128,13 @@ class SNNLM(nn.Module):
         if self.abstraction_head is not None:
             quantized, _ = self.abstraction_head(x, update=update_memory)
             x = x + self.config.abstraction_residual_scale * quantized
-            # commitment loss sólo en training
             if self.training:
                 z = self.abstraction_head.proj(x)
                 vq_loss = F.mse_loss(z, quantized.detach())
 
-        logits = self.head(self.ln_f(x))
-        return logits, new_kv_caches, vq_loss
+        hidden = self.ln_f(x)
+        logits = self.head(hidden)
+        return logits, new_kv_caches, vq_loss, hidden
 
     def forward(
         self,
@@ -144,7 +144,7 @@ class SNNLM(nn.Module):
         start_pos: int = 0,
         update_memory: Optional[bool] = None,
     ):
-        logits, new_kv_caches, vq_loss = self._forward(
+        logits, new_kv_caches, vq_loss, hidden = self._forward(
             idx, kv_caches, start_pos, update_memory,
         )
 
@@ -158,22 +158,16 @@ class SNNLM(nn.Module):
             if vq_loss is not None and self.config.abstraction_loss_weight > 0:
                 loss = loss + self.config.abstraction_loss_weight * vq_loss
 
-            # Self-knowledge loss
-            if self.self_knowledge_head is not None and \
-                    self.config.self_knowledge_loss_weight > 0:
+            # Self-knowledge loss (usa `hidden` que acabamos de calcular)
+            if (
+                self.self_knowledge_head is not None
+                and self.config.self_knowledge_loss_weight > 0
+            ):
                 concept_emb = self.tok_emb(idx)
-                # Recomputar hidden state sin ln_f ni head (ya está en _forward)
-                # Para eficiencia, exponer hidden states
-                # Simplificación: recomputar (costoso pero simple)
-                # Alternativa: guardar hidden en _forward y usarlo aquí
-                # → usamos un atributo cacheado
-                if hasattr(self, "_last_hidden_for_sk") and \
-                        self._last_hidden_for_sk is not None:
-                    sk = self.self_knowledge_head(
-                        self._last_hidden_for_sk, concept_emb,
-                    )
-                    sk_loss = SelfKnowledgeHead.compute_loss(sk, logits, targets)
-                    loss = loss + self.config.self_knowledge_loss_weight * sk_loss
+                sk = self.self_knowledge_head(hidden, concept_emb)
+                self._last_self_knowledge = sk.detach()
+                sk_loss = SelfKnowledgeHead.compute_loss(sk, logits, targets)
+                loss = loss + self.config.self_knowledge_loss_weight * sk_loss
 
         if kv_caches is not None:
             return logits, loss, new_kv_caches
@@ -244,7 +238,7 @@ class SNNLM(nn.Module):
 
         if use_cache and idx.size(1) < seq_len:
             kv_caches = [None] * len(self.blocks)
-            logits, _, _ = self(
+            logits, _, _, _ = self(
                 idx, kv_caches=kv_caches, start_pos=0,
                 update_memory=update_memory,
             )
@@ -263,7 +257,7 @@ class SNNLM(nn.Module):
                 break
 
             if use_cache and pos + 1 <= seq_len:
-                logits, _, _ = self(
+                logits, _, _, _ = self(
                     idx_next, kv_caches=kv_caches, start_pos=pos,
                     update_memory=update_memory,
                 )
