@@ -1,9 +1,4 @@
-"""Genera texto desde un checkpoint con verificación opcional contra corpus.
-
-Ejemplos:
-    snnlm-generate --ckpt checkpoints/best.pt --prompt "Once upon a time"
-    snnlm-generate --ckpt checkpoints/best.pt --prompt "Once" --corpus data/ --verify
-"""
+"""Genera texto desde un checkpoint (con o sin RT)."""
 from __future__ import annotations
 
 import argparse
@@ -11,15 +6,9 @@ import logging
 import os
 
 from snn_lm_v3 import (
-    SNNLM,
-    generate,
-    resolve_device,
-    load_texts,
-    CorpusObserver,
-    ReasoningGraph,
-    ConsistencyVerifier,
-    SignalProbe,
-    load_graph,
+    SNNLM, generate, resolve_device, load_texts,
+    CorpusObserver, ReasoningGraph, ConsistencyVerifier,
+    SignalProbe, load_graph,
 )
 from snn_lm_v3.checkpoint import load_checkpoint
 
@@ -36,12 +25,9 @@ def parse_args():
     p.add_argument("--samples", type=int, default=1)
     p.add_argument("--device", default="auto")
     p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--corpus", default=None,
-                   help="Directorio/archivo .txt para construir el grafo.")
-    p.add_argument("--graph", default=None,
-                   help="Ruta a un graph.pt guardado (si no, se construye de --corpus).")
-    p.add_argument("--verify", action="store_true",
-                   help="Verificar la generación contra el corpus y las señales.")
+    p.add_argument("--corpus", default=None)
+    p.add_argument("--graph", default=None)
+    p.add_argument("--verify", action="store_true")
     p.add_argument("--chunk-size", type=int, default=500)
     return p.parse_args()
 
@@ -49,15 +35,13 @@ def parse_args():
 def build_or_load_graph(args):
     if args.graph and os.path.exists(args.graph):
         return load_graph(args.graph), None
-
     if not args.corpus:
         return None, None
-
-    observer = CorpusObserver(enc_name="gpt2")
+    observer = CorpusObserver(enc_name="cl100k_base")
     docs = load_texts([args.corpus])
     for i, doc in enumerate(docs):
         for j in range(0, len(doc), args.chunk_size):
-            observer.observe(doc[j : j + args.chunk_size], ref=f"ref{i}_{j}")
+            observer.observe(doc[j:j + args.chunk_size], ref=f"ref{i}_{j}")
     graph = ReasoningGraph(cooldown_steps=3)
     graph.mine_from_corpus(observer)
     return graph, observer
@@ -65,17 +49,14 @@ def build_or_load_graph(args):
 
 def main():
     args = parse_args()
-
     logging.basicConfig(
         level=logging.INFO,
-        format="[%(asctime)s] %(message)s",
-        datefmt="%H:%M:%S",
+        format="[%(asctime)s] %(message)s", datefmt="%H:%M:%S",
     )
-
     device = resolve_device(args.device)
     ckpt = load_checkpoint(args.ckpt, SNNLM, device)
     model, cfg, step = ckpt["model"], ckpt["config"], ckpt["step"]
-    print(f"Checkpoint step={step}, params={model.num_params():,}, device={device}")
+    print(f"Checkpoint step={step}, params={model.num_params():,}, RT={ckpt['use_rt']}")
 
     graph, observer = build_or_load_graph(args)
     if graph is not None:
@@ -89,14 +70,11 @@ def main():
     for i in range(args.samples):
         seed = None if args.seed is None else args.seed + i
         text = generate(
-            model,
-            prompt=args.prompt,
+            model, prompt=args.prompt,
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=seed,
-            device=device,
+            top_k=args.top_k, top_p=args.top_p,
+            seed=seed, device=device,
             use_cache=not args.no_cache,
         )
         print(f"\n--- muestra {i + 1} ---")
@@ -107,8 +85,7 @@ def main():
             if probe is not None:
                 signals = probe.probe(text)
                 problems += verifier.verify(text, signals)
-            verdict = verifier.verdict(problems)
-            print(f"[veredicto: {verdict}]")
+            print(f"[veredicto: {verifier.verdict(problems)}]")
             for p in problems:
                 print(f"  - [{p.type}] {p.note}")
 
