@@ -19,9 +19,9 @@ from snn_lm_v3 import (
     ReasoningGraph,
     ConsistencyVerifier,
     SignalProbe,
+    load_graph,
 )
 from snn_lm_v3.checkpoint import load_checkpoint
-from snn_lm_v3.reasoning import load_graph
 
 
 def parse_args():
