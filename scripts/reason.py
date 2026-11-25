@@ -1,21 +1,21 @@
 """Consulta el grafo de razonamiento sin generar texto.
 
 Ejemplos:
-    python scripts/reason.py --graph checkpoints/graph.pt --stats
-    python scripts/reason.py --graph checkpoints/graph.pt --apply "quick" "fox" "lazy"
-    python scripts/reason.py --corpus data/ --mine --save checkpoints/graph.pt
+    snnlm-reason --graph checkpoints/graph.pt --stats
+    snnlm-reason --graph checkpoints/graph.pt --apply "quick" "fox" "lazy"
+    snnlm-reason --corpus data/ --mine --save checkpoints/graph.pt
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from snn_lm_v3 import (
-    load_texts, CorpusObserver, ReasoningGraph, save_graph,
+    load_texts,
+    CorpusObserver,
+    ReasoningGraph,
+    save_graph,
 )
 from snn_lm_v3.reasoning import load_graph
 
