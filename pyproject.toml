@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snn-lm-v3"
-version = "3.1.0"
+version = "3.2.0"
 description = "Causal transformer with surrogate-gradient spiking FFN (LIF), RoPE, and symbolic reasoning layer over the corpus."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,7 +28,7 @@ snnlm-generate = "scripts.generate:main"
 snnlm-reason = "scripts.reason:main"
 
 [tool.setuptools.packages.find]
-include = ["snn_lm_v3*"]
+include = ["snn_lm_v3*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
