@@ -1,11 +1,4 @@
-"""Entrena SNN-LM v3.2 sobre archivos .txt con razonamiento simbólico opcional.
-
-Ejemplos:
-    snnlm-train data/ --size tiny
-    snnlm-train data/ --size medium --device cuda
-    snnlm-train data/ --config my_config.json --resume checkpoints/latest.pt
-    snnlm-train data/ --size tiny --max-steps 500 --no-reasoning
-"""
+"""Entrena SNN-LM v4.1 con o sin RT, con o sin código, con split por repo."""
 from __future__ import annotations
 
 import argparse
@@ -15,19 +8,14 @@ import os
 import torch
 
 from snn_lm_v3 import (
-    GPTConfig,
-    SIZES,
-    SNNLM,
-    make_dataloader,
-    train,
-    resolve_device,
-    load_texts,
-    CorpusObserver,
-    ReasoningGraph,
-    ConsistencyVerifier,
-    save_graph,
-    generate,
+    GPTConfig, SIZES, SNNLM,
+    make_dataloader, make_rt_dataloader,
+    train, resolve_device, load_texts_with_paths,
+    CorpusObserver, CodeCorpusObserver, ReasoningGraph,
+    ConsistencyVerifier, save_graph, generate,
+    ResonantVocab, RVConfig, RTModelWrapper,
 )
+from snn_lm_v3.dataset import CODE_EXTENSIONS
 from snn_lm_v3.checkpoint import load_checkpoint
 
 
@@ -54,16 +42,31 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--compile", action="store_true")
     p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--snn-mode", choices=["static", "multi_step", "temporal", "gelu"],
-                   default=None, help="Modo de la SNN en el FFN.")
-    p.add_argument("--snn-steps", type=int, default=None,
-                   help="Pasos internos por token en multi_step.")
-    p.add_argument("--snn-track-stats", action="store_true",
-                   help="Registrar firing_rate (necesario para razonamiento con señales).")
-    p.add_argument("--no-reasoning", action="store_true",
-                   help="Desactivar la capa de razonamiento simbólico.")
-    p.add_argument("--reasoning-chunk-size", type=int, default=500,
-                   help="Tamaño de ventana al observar el corpus.")
+    p.add_argument("--snn-mode", choices=["static", "multi_step", "temporal", "gelu"], default=None)
+    p.add_argument("--snn-steps", type=int, default=None)
+    p.add_argument("--snn-track-stats", action="store_true")
+    p.add_argument("--analyzer", action="store_true",
+                   help="Activar ContinuousAnalyzer (prune + codebook refresh).")
+    p.add_argument("--analyzer-interval", type=float, default=60.0)
+
+    # Razonamiento
+    p.add_argument("--no-reasoning", action="store_true")
+    p.add_argument("--code-corpus", action="store_true",
+                   help="Usar CodeCorpusObserver (para corpus de código).")
+    p.add_argument("--reasoning-chunk-size", type=int, default=500)
+
+    # Corpus / split
+    p.add_argument("--split-by", choices=["file", "repo"], default="file",
+                   help="Split train/val: 'file' o 'repo' (evita val leak).")
+    p.add_argument("--extensions", nargs="+", default=[".txt"],
+                   help="Extensiones a incluir. Usa '.py' '.js' para código.")
+
+    # RT
+    p.add_argument("--use-rt", action="store_true")
+    p.add_argument("--bpe-path", default="checkpoints/bpe_code.json")
+    p.add_argument("--n-concepts", type=int, default=12_092)
+    p.add_argument("--concept-dim", type=int, default=132)
+    p.add_argument("--aux-loss-weight", type=float, default=0.1)
     return p.parse_args()
 
 
@@ -77,23 +80,32 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def build_reasoning_layer(data_paths, chunk_size: int, logger):
-    """Observa el corpus y mina reglas simbólicas."""
-    observer = CorpusObserver(enc_name="gpt2")
+def build_reasoning_layer(
+    data_paths, chunk_size, logger, enc_name, use_code, extensions,
+):
+    """Construye el observer adecuado (prosa o código) y mina reglas."""
+    if use_code:
+        observer = CodeCorpusObserver(enc_name=enc_name)
+        logger.info("Usando CodeCorpusObserver (corpus de código)")
+    else:
+        observer = CorpusObserver(enc_name=enc_name)
+        logger.info("Usando CorpusObserver (prosa)")
+
     graph = ReasoningGraph(cooldown_steps=3)
-
-    docs = load_texts(data_paths)
+    docs = load_texts_with_paths(data_paths, extensions=tuple(extensions))
     logger.info(f"Observando {len(docs)} documentos del corpus...")
-    for i, doc in enumerate(docs):
-        for j in range(0, len(doc), chunk_size):
-            observer.observe(doc[j : j + chunk_size], ref=f"doc{i}_chunk{j}")
+    for i, (path, content) in enumerate(docs):
+        for j in range(0, len(content), chunk_size):
+            observer.observe(content[j:j + chunk_size], ref=f"{path}:{j}")
 
-    logger.info(f"CorpusObserver: {observer.get_state()}")
+    state = observer.get_state()
+    logger.info(f"Observer state: {state}")
     n_rules = graph.mine_from_corpus(observer)
     logger.info(
-        f"ReasoningGraph: {n_rules} reglas minadas, "
+        f"ReasoningGraph: {n_rules} reglas nuevas, "
         f"{graph.get_state()['rules_count']} totales "
-        f"({graph.metrics['cyclic_rejected']} cíclicas rechazadas, "
+        f"({graph.metrics['cyclic_rejected']} cíclicas, "
+        f"{graph.metrics['overlap_rejected']} overlap, "
         f"{graph.metrics['tautological_rejected']} tautológicas)"
     )
     return observer, graph
@@ -122,6 +134,8 @@ def main():
         "device": args.device,
         "snn_mode": args.snn_mode,
         "snn_num_steps": args.snn_steps,
+        "split_by": args.split_by,
+        "code_corpus": args.code_corpus or None,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -132,6 +146,22 @@ def main():
         cfg.use_amp = False
     if args.snn_track_stats:
         cfg.snn_track_stats = True
+    if args.analyzer:
+        cfg.analyzer_enabled = True
+        cfg.analyzer_interval_s = args.analyzer_interval
+
+    # ── RT setup ──
+    if args.use_rt:
+        cfg.use_rt = True
+        cfg.rt_bpe_path = args.bpe_path
+        cfg.rt_n_concepts = args.n_concepts
+        cfg.rt_concept_dim = args.concept_dim
+        cfg.rt_aux_loss_weight = args.aux_loss_weight
+        rv_probe = ResonantVocab.from_bpe(args.bpe_path)
+        cfg.rt_bpe_vocab_size = rv_probe.vocab_size
+        cfg.vocab_size = rv_probe.vocab_size
+        print(f"[RT] BPE vocab={rv_probe.vocab_size}, n_concepts={args.n_concepts}")
+
     cfg.validate()
 
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -148,20 +178,29 @@ def main():
     device = resolve_device(cfg.device)
     logger.info(f"Device: {device}")
 
-    # ---------------- razonamiento sobre corpus ----------------
+    # ── Extensiones: si --code-corpus y no se especificaron, usar defaults de código
+    extensions = args.extensions
+    if args.code_corpus and extensions == [".txt"]:
+        extensions = list(CODE_EXTENSIONS)
+        logger.info(f"Extensiones de código auto: {len(extensions)} tipos")
+
+    # ── Razonamiento ──
     observer, graph = None, None
     if not args.no_reasoning:
         try:
             observer, graph = build_reasoning_layer(
-                args.data, args.reasoning_chunk_size, logger
+                args.data, args.reasoning_chunk_size, logger,
+                enc_name="cl100k_base",
+                use_code=args.code_corpus,
+                extensions=extensions,
             )
             save_graph(graph, os.path.join(cfg.out_dir, "graph.pt"))
             logger.info(f"Grafo guardado en {os.path.join(cfg.out_dir, 'graph.pt')}")
         except Exception as e:
-            logger.warning(f"Razonamiento desactivado por error: {e}")
+            logger.warning(f"Razonamiento desactivado: {e}")
             observer, graph = None, None
 
-    # ---------------- modelo ----------------
+    # ── Modelo ──
     optimizer = None
     optimizer_state = None
     scheduler_state = None
@@ -176,60 +215,63 @@ def main():
         best_val_loss = ckpt.get("best_val_loss")
         optimizer_state = ckpt.get("optimizer_state")
         scheduler_state = ckpt.get("scheduler_state")
-        logger.info(f"Resume desde step={start_step}")
         if optimizer_state is not None:
             optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=cfg.lr,
-                weight_decay=cfg.weight_decay,
-                betas=(cfg.beta1, cfg.beta2),
-                eps=1e-8,
+                model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
+                betas=(cfg.beta1, cfg.beta2), eps=1e-8,
             )
     else:
-        model = SNNLM(cfg)
+        snnlm = SNNLM(cfg)
+        if cfg.use_rt:
+            rv = ResonantVocab.from_bpe(cfg.rt_bpe_path, RVConfig(
+                n_concepts=cfg.rt_n_concepts,
+                concept_dim=cfg.rt_concept_dim,
+                embedding_dim=cfg.n_embd,
+                ema_decay=cfg.rt_ema_decay,
+                commitment_beta=cfg.rt_commitment_beta,
+                min_count_for_update=cfg.rt_min_count_for_update,
+                concept_top_k_tokens=cfg.rt_concept_top_k_tokens,
+            ))
+            model = RTModelWrapper(snnlm, rv, aux_loss_weight=cfg.rt_aux_loss_weight)
+        else:
+            model = snnlm
 
     logger.info(f"Parámetros: {model.num_params():,}")
 
-    train_dl, val_dl, _ = make_dataloader(
-        args.data,
-        cfg.seq_len,
-        cfg.batch_size,
-        enc_name="gpt2",
-        seed=cfg.seed,
-        num_workers=cfg.num_workers,
-    )
+    # ── Dataloaders ──
+    if cfg.use_rt:
+        train_dl, val_dl = make_rt_dataloader(
+            args.data, cfg.seq_len, cfg.batch_size, model.rv,
+            seed=cfg.seed, num_workers=cfg.num_workers,
+            split_by=cfg.split_by, extensions=tuple(extensions),
+        )
+    else:
+        train_dl, val_dl, _ = make_dataloader(
+            args.data, cfg.seq_len, cfg.batch_size,
+            enc_name="cl100k_base", seed=cfg.seed,
+            num_workers=cfg.num_workers,
+            split_by=cfg.split_by, extensions=tuple(extensions),
+        )
     logger.info(f"Train batches/epoch: {len(train_dl)}, Val: {len(val_dl)}")
 
     model = train(
-        model,
-        train_dl,
-        val_dl,
-        cfg,
-        logger,
-        start_step=start_step,
-        optimizer=optimizer,
-        optimizer_state=optimizer_state,
-        scheduler_state=scheduler_state,
+        model, train_dl, val_dl, cfg, logger,
+        start_step=start_step, optimizer=optimizer,
+        optimizer_state=optimizer_state, scheduler_state=scheduler_state,
         best_val_loss=best_val_loss,
     )
 
-    # ---------------- verificación final contra corpus ----------------
+    # ── Verificación final ──
     if graph is not None and observer is not None:
         logger.info("Verificación final contra corpus...")
         text = generate(
-            model,
-            prompt="The quick brown",
-            max_new_tokens=80,
-            temperature=0.8,
-            top_k=40,
-            top_p=0.95,
-            seed=1,
-            device=device,
+            model, prompt="def " if args.code_corpus else "The quick brown",
+            max_new_tokens=80, temperature=0.8, top_k=40, top_p=0.95,
+            seed=1, device=device,
         )
         verifier = ConsistencyVerifier()
         problems = verifier.verify_against_corpus(text, graph, observer)
-        verdict = verifier.verdict(problems)
-        logger.info(f"Veredicto: {verdict}")
+        logger.info(f"Veredicto: {verifier.verdict(problems)}")
         for p in problems:
             logger.info(f"  - [{p.type}] {p.note}")
 
