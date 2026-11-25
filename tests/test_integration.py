@@ -50,6 +50,7 @@ def test_full_pipeline_generate_and_verify(gpt2_enc):
     text = generate(
         model, prompt="The clever", max_new_tokens=10,
         temperature=0.8, top_k=40, top_p=0.95, seed=1,
+        update_memory=False,
     )
     assert isinstance(text, str)
 
@@ -70,6 +71,24 @@ def test_signal_probe_returns_signals(gpt2_enc):
     assert signals.n_tokens > 0
     assert 0.0 <= signals.mean_spike_rate <= 1.0
     assert signals.output_entropy >= 0.0
+
+
+def test_signal_probe_does_not_pollute_memory(gpt2_enc):
+    """`probe` usa `update_memory=False`, así que el estado no cambia."""
+    cfg = GPTConfig(
+        n_layer=1, n_head=1, n_embd=16, seq_len=32, vocab_size=50257,
+        snn_mode="multi_step", snn_num_steps=2, snn_track_stats=True,
+        dropout=0.0,
+        neural_memory_enabled=True,
+    )
+    torch.manual_seed(0)
+    model = SNNLM(cfg)
+    model.eval()
+    size_before = int(model.neural_memory.size.item())
+    probe = SignalProbe(model)
+    probe.probe("The clever fox")
+    size_after = int(model.neural_memory.size.item())
+    assert size_after == size_before
 
 
 def test_signal_probe_feeds_verifier(gpt2_enc):
@@ -98,13 +117,16 @@ def test_persist_and_reload_graph_then_apply():
 
 
 def test_end_to_end_with_cache_and_no_cache(gpt2_enc):
+    """Equivalencia cache/no-cache con memoria desactivada."""
     model = _tiny_model()
     model.eval()
     text1 = generate(
-        model, prompt="The clever", max_new_tokens=5, seed=7, use_cache=True
+        model, prompt="The clever", max_new_tokens=5, seed=7,
+        use_cache=True, update_memory=False,
     )
     text2 = generate(
-        model, prompt="The clever", max_new_tokens=5, seed=7, use_cache=False
+        model, prompt="The clever", max_new_tokens=5, seed=7,
+        use_cache=False, update_memory=False,
     )
-    # Misma semilla → misma salida
+    # Misma semilla + memoria quieta → misma salida
     assert text1 == text2
