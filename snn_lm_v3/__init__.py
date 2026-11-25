@@ -1,5 +1,6 @@
-"""SNN-LM v4.0 — Transformer causal con FFN de spikes, memoria neural,
-abstracción geométrica, autoconocimiento y capa de razonamiento simbólico."""
+"""SNN-LM v4.1 — Transformer causal con FFN de spikes, memoria neural,
+abstracción geométrica, autoconocimiento, razonamiento simbólico y
+Resonant Tokenizer (BPE + VQ)."""
 from .config import (
     GPTConfig, resolve_device,
     SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE, SIZES,
@@ -15,11 +16,17 @@ from .model import SNNLM
 from .memory import (
     NeuralMemory, AbstractionHead, SelfKnowledgeHead, LatentReasoner,
 )
-from .dataset import TextDataset, load_texts, make_dataloader
+from .dataset import TextDataset, load_texts, make_dataloader, make_rt_dataloader
 from .train import train, evaluate
 from .generate import generate
 from .checkpoint import save_checkpoint, load_checkpoint
 from .analyzer import ContinuousAnalyzer
+
+# Resonant Tokenizer (v4.1)
+from .tokenizer import (
+    ResonantVocab, RVConfig, RTModelWrapper,
+    train_bpe, iter_corpus,
+)
 
 from .reasoning import (
     SignalProbe, InternalSignals,
@@ -29,7 +36,7 @@ from .reasoning import (
     save_graph, load_graph,
 )
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 
 __all__ = [
     # config
@@ -42,14 +49,17 @@ __all__ = [
     "precompute_rope", "apply_rope", "rotate_half",
     # transformer
     "MultiHeadAttention", "TransformerBlock", "SNNLM",
-    # memory (v4.0)
+    # memory
     "NeuralMemory", "AbstractionHead", "SelfKnowledgeHead", "LatentReasoner",
     # data
-    "TextDataset", "load_texts", "make_dataloader",
+    "TextDataset", "load_texts", "make_dataloader", "make_rt_dataloader",
     # training
     "train", "evaluate", "generate", "save_checkpoint", "load_checkpoint",
-    # analyzer (v4.0)
+    # analyzer
     "ContinuousAnalyzer",
+    # RT (v4.1)
+    "ResonantVocab", "RVConfig", "RTModelWrapper",
+    "train_bpe", "iter_corpus",
     # reasoning
     "SignalProbe", "InternalSignals",
     "CorpusObserver", "Observation",
