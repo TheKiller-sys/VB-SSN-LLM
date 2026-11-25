@@ -122,6 +122,10 @@ class GPTConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
+    # En GPTConfig, dentro de la sección "---- sistema ----" o antes:
+    code_corpus: bool = False       # NUEVO: activa CodeCorpusObserver
+    split_by: str = "file"          # NUEVO: "file" | "repo"
+
     def validate(self) -> None:
         checks = [
             (self.vocab_size > 0, "vocab_size must be > 0"),
@@ -177,6 +181,8 @@ class GPTConfig:
             (self.rt_commitment_beta >= 0, "rt_commitment_beta must be >= 0"),
             (self.rt_min_count_for_update >= 0, "rt_min_count_for_update must be >= 0"),
             (self.rt_concept_top_k_tokens >= 1, "rt_concept_top_k_tokens must be >= 1"),
+            # Dentro de la lista `checks`:
+            (self.split_by in ("file", "repo"), f"invalid split_by: {self.split_by}"),
         ]
         for ok, msg in checks:
             if not ok:
