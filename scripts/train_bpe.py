@@ -4,8 +4,15 @@
 Uso:
     python scripts/train_bpe.py --corpus data/code/ --vocab-size 40000 --out checkpoints/bpe_code.json
 """
+from __future__ import annotations
+
 import argparse
-from snn_lm_v3.tokenizer.bpe_trainer import train_bpe
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from snn_lm_v4.tokenizer.bpe_trainer import train_bpe
 
 
 def main():
