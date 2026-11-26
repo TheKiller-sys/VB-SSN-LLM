@@ -1,8 +1,8 @@
-"""Fine-tuning incremental con LoRA.
+"""Fine-tuning incremental con LoRA sobre un checkpoint v4.3.
 
-FIX v4.2.1:
-  - Eliminado import muerto `CODE_EXTENSIONS`.
-  - Paquete renombrado a `snn_lm_v4`.
+Uso:
+    python scripts/train_lora.py data/new/ --base checkpoints/run1/best.pt \\
+        --out checkpoints/lora_new.pt --max-steps 500
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 
 from snn_lm_v4 import (
-    SNNLM, GPTConfig, make_dataloader, make_rt_dataloader,
+    SNNLM, make_dataloader, make_rt_dataloader,
     train, resolve_device, load_checkpoint,
     apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
 )
@@ -30,7 +30,8 @@ def parse_args():
     p.add_argument("--r", type=int, default=8)
     p.add_argument("--alpha", type=float, default=16.0)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--targets", nargs="+", default=["qkv", "proj", "fc1", "fc2"])
+    p.add_argument("--targets", nargs="+", default=None,
+                   help="Si None, se autodetectan según core/ffn del base.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--max-steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=None)
@@ -64,6 +65,7 @@ def main():
     ckpt = load_checkpoint(args.base, SNNLM, device, load_optimizer=False)
     model = ckpt["model"]
     cfg = ckpt["config"]
+    logger.info(f"Base core={cfg.core_type}, ffn={cfg.ffn_mode}")
 
     # Overrides de entrenamiento
     if args.batch_size is not None:
@@ -91,14 +93,17 @@ def main():
     cfg.lora_r = args.r
     cfg.lora_alpha = args.alpha
     cfg.lora_dropout = args.dropout
-    cfg.lora_targets = list(args.targets)
+    if args.targets:
+        cfg.lora_targets = list(args.targets)
+    # else: apply_lora autodetecta
     cfg.lora_path = args.out
     cfg.validate()
 
     # Aplicar LoRA
     n_modules = apply_lora(
         model, r=args.r, alpha=args.alpha,
-        dropout=args.dropout, targets=tuple(args.targets),
+        dropout=args.dropout,
+        targets=tuple(args.targets) if args.targets else None,
     )
     n_trainable = freeze_base_for_lora(model)
     logger.info(
@@ -135,7 +140,9 @@ def main():
         "step": int(cfg.max_steps),
         "r": args.r,
         "alpha": args.alpha,
-        "targets": list(args.targets),
+        "targets": list(cfg.lora_targets) if cfg.lora_targets else None,
+        "core_type": cfg.core_type,
+        "ffn_mode": cfg.ffn_mode,
     })
     logger.info(f"Adapter LoRA guardado en {args.out}")
 
