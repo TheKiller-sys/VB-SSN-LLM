@@ -1,24 +1,44 @@
 services:
   dashboard:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: snnlm-v43:latest
+    container_name: snnlm-dashboard
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"   # solo localhost; usa Nginx/Caddy delante si expones
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./checkpoints:/app/checkpoints
       - ./state.db:/app/state.db
     environment:
-      - CUDA_VISIBLE_DEVICES=0
+      # Rutas internas
       - SNNLM_DATA_ROOT=/app/data
       - SNNLM_CKPT_ROOT=/app/checkpoints
       - SNNLM_LOG_ROOT=/app/logs
+      - SNNLM_STATE_DB=/app/state.db
+      # Forzar CPU y limitar hilos (2 cores)
+      - CUDA_VISIBLE_DEVICES=""
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - OPENBLAS_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=2
+      - TOKENIZERS_PARALLELISM=false
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
-    shm_size: "16gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    shm_size: "1gb"                # antes 16gb; 1gb sobra para 2 workers
+    mem_limit: 6g
+    memswap_limit: 8g
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://localhost:8000/api/admin/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
