@@ -1,4 +1,11 @@
-"""Entrena SNN-LM v4.2 con o sin RT, LoRA, o código, con split por repo."""
+"""Entrena SNN-LM v4.2 con o sin RT, LoRA, o código, con split por repo.
+
+FIX v4.2.1:
+  - Sincroniza `cfg` con `ckpt["config"]` al hacer `--resume` (evita
+    desincronización de arquitectura entre CLI y checkpoint).
+  - RT setup usa `Tokenizer.from_file` directamente (no instancia un
+    `ResonantVocab` completo solo para leer vocab_size).
+"""
 from __future__ import annotations
 
 import argparse
@@ -10,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     GPTConfig, SIZES, SNNLM,
     make_dataloader, make_rt_dataloader,
     train, resolve_device, load_texts_with_paths,
@@ -19,8 +26,8 @@ from snn_lm_v3 import (
     ResonantVocab, RVConfig, RTModelWrapper,
     apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
 )
-from snn_lm_v3.dataset import CODE_EXTENSIONS
-from snn_lm_v3.checkpoint import load_checkpoint
+from snn_lm_v4.dataset import CODE_EXTENSIONS
+from snn_lm_v4.checkpoint import load_checkpoint
 
 
 def parse_args():
@@ -68,7 +75,7 @@ def parse_args():
     p.add_argument("--concept-dim", type=int, default=132)
     p.add_argument("--aux-loss-weight", type=float, default=0.1)
 
-    # LoRA (opcional; normalmente se usa scripts/train_lora.py)
+    # LoRA
     p.add_argument("--lora", action="store_true",
                    help="Aplicar LoRA sobre el modelo base (entrena solo A,B).")
     p.add_argument("--lora-r", type=int, default=8)
@@ -119,9 +126,36 @@ def build_reasoning_layer(data_paths, chunk_size, logger, enc_name, use_code, ex
     return observer, graph
 
 
+def _apply_cli_overrides(cfg, args, overrides):
+    for k, v in overrides.items():
+        if v is not None:
+            setattr(cfg, k, v)
+    if args.compile:
+        cfg.compile = True
+    if args.no_amp:
+        cfg.use_amp = False
+    if args.snn_track_stats:
+        cfg.snn_track_stats = True
+    if args.analyzer:
+        cfg.analyzer_enabled = True
+        cfg.analyzer_interval_s = args.analyzer_interval
+    if args.rag_kb:
+        cfg.rag_enabled = True
+        cfg.rag_kb_path = args.rag_kb
+        cfg.rag_top_k = args.rag_top_k
+    if args.lora:
+        cfg.lora_enabled = True
+        cfg.lora_r = args.lora_r
+        cfg.lora_alpha = args.lora_alpha
+        cfg.lora_dropout = args.lora_dropout
+        cfg.lora_targets = list(args.lora_targets)
+        cfg.lora_path = args.lora_out or os.path.join(cfg.out_dir, "lora.pt")
+
+
 def main():
     args = parse_args()
 
+    # ── 1. Config base + overrides ──
     cfg = GPTConfig.load(args.config) if args.config else GPTConfig(**SIZES[args.size])
 
     overrides = {
@@ -145,99 +179,60 @@ def main():
         "split_by": args.split_by,
         "code_corpus": args.code_corpus or None,
     }
-    for k, v in overrides.items():
-        if v is not None:
-            setattr(cfg, k, v)
-    if args.compile:
-        cfg.compile = True
-    if args.no_amp:
-        cfg.use_amp = False
-    if args.snn_track_stats:
-        cfg.snn_track_stats = True
-    if args.analyzer:
-        cfg.analyzer_enabled = True
-        cfg.analyzer_interval_s = args.analyzer_interval
-
-    # RAG config
-    if args.rag_kb:
-        cfg.rag_enabled = True
-        cfg.rag_kb_path = args.rag_kb
-        cfg.rag_top_k = args.rag_top_k
-
-    # LoRA config
-    if args.lora:
-        cfg.lora_enabled = True
-        cfg.lora_r = args.lora_r
-        cfg.lora_alpha = args.lora_alpha
-        cfg.lora_dropout = args.lora_dropout
-        cfg.lora_targets = list(args.lora_targets)
-        cfg.lora_path = args.lora_out or os.path.join(cfg.out_dir, "lora.pt")
-
-    # RT setup
-    if args.use_rt:
-        cfg.use_rt = True
-        cfg.rt_bpe_path = args.bpe_path
-        cfg.rt_n_concepts = args.n_concepts
-        cfg.rt_concept_dim = args.concept_dim
-        cfg.rt_aux_loss_weight = args.aux_loss_weight
-        rv_probe = ResonantVocab.from_bpe(args.bpe_path)
-        cfg.rt_bpe_vocab_size = rv_probe.vocab_size
-        cfg.vocab_size = rv_probe.vocab_size
-        print(f"[RT] BPE vocab={rv_probe.vocab_size}, n_concepts={args.n_concepts}")
-
+    _apply_cli_overrides(cfg, args, overrides)
     cfg.validate()
 
-    os.makedirs(cfg.out_dir, exist_ok=True)
-    cfg.save(os.path.join(cfg.out_dir, "config.json"))
-
+    # ── 2. Logging + device ──
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
                         datefmt="%H:%M:%S")
     logger = logging.getLogger("train")
 
-    set_seed(cfg.seed)
-    device = resolve_device(cfg.device)
-    logger.info(f"Device: {device}")
-
-    extensions = args.extensions
-    if args.code_corpus and extensions == [".txt"]:
-        extensions = list(CODE_EXTENSIONS)
-        logger.info(f"Extensiones de código auto: {len(extensions)} tipos")
-
-    # Razonamiento
-    observer, graph = None, None
-    if not args.no_reasoning:
-        try:
-            observer, graph = build_reasoning_layer(
-                args.data, args.reasoning_chunk_size, logger,
-                enc_name="cl100k_base",
-                use_code=args.code_corpus,
-                extensions=extensions,
-            )
-            save_graph(graph, os.path.join(cfg.out_dir, "graph.pt"))
-            logger.info(f"Grafo guardado en {os.path.join(cfg.out_dir, 'graph.pt')}")
-        except Exception as e:
-            logger.warning(f"Razonamiento desactivado: {e}")
-            observer, graph = None, None
-
-    # Modelo
-    optimizer = None
-    optimizer_state = None
-    scheduler_state = None
-    best_val_loss = None
-    start_step = 0
-
+    # ── 3. Resume OR fresh model ──
     if args.resume:
         logger.info(f"Cargando checkpoint {args.resume}")
+        device = resolve_device(cfg.device)
         ckpt = load_checkpoint(args.resume, SNNLM, device, load_optimizer=True)
         model = ckpt["model"]
+        # FIX v4.2.1: adoptar cfg del checkpoint (arquitectura) y re-aplicar overrides
+        cfg = ckpt["config"]
+        _apply_cli_overrides(cfg, args, overrides)
+        if args.use_rt and not cfg.use_rt:
+            logger.warning("--use-rt ignorado: el checkpoint no fue RT")
+        cfg.validate()
+        set_seed(cfg.seed)
+        device = resolve_device(cfg.device)
+
         start_step = ckpt["step"]
         best_val_loss = ckpt.get("best_val_loss")
         optimizer_state = ckpt.get("optimizer_state")
         scheduler_state = ckpt.get("scheduler_state")
         if optimizer_state is not None:
-            from snn_lm_v3.train import _build_optimizer
+            from snn_lm_v4.train import _build_optimizer
             optimizer = _build_optimizer(model, cfg, optimizer_state)
+        else:
+            optimizer = None
     else:
+        # RT setup
+        if args.use_rt:
+            from tokenizers import Tokenizer
+            cfg.use_rt = True
+            cfg.rt_bpe_path = args.bpe_path
+            cfg.rt_n_concepts = args.n_concepts
+            cfg.rt_concept_dim = args.concept_dim
+            cfg.rt_aux_loss_weight = args.aux_loss_weight
+            # FIX v4.2.1: no instanciar ResonantVocab entero
+            cfg.rt_bpe_vocab_size = Tokenizer.from_file(args.bpe_path).get_vocab_size()
+            cfg.vocab_size = cfg.rt_bpe_vocab_size
+            print(f"[RT] BPE vocab={cfg.rt_bpe_vocab_size}, n_concepts={args.n_concepts}")
+        cfg.validate()
+
+        os.makedirs(cfg.out_dir, exist_ok=True)
+        cfg.save(os.path.join(cfg.out_dir, "config.json"))
+
+        set_seed(cfg.seed)
+        device = resolve_device(cfg.device)
+        logger.info(f"Device: {device}")
+
         snnlm = SNNLM(cfg)
         if cfg.use_rt:
             rv = ResonantVocab.from_bpe(cfg.rt_bpe_path, RVConfig(
@@ -253,7 +248,6 @@ def main():
         else:
             model = snnlm
 
-        # LoRA ANTES de train() (que hace compile)
         if cfg.lora_enabled:
             n = apply_lora(
                 model, r=cfg.lora_r, alpha=cfg.lora_alpha,
@@ -264,9 +258,37 @@ def main():
                 f"LoRA: {n} módulos, {count_lora_params(model):,} params entrenables"
             )
 
+        start_step = 0
+        best_val_loss = None
+        optimizer = None
+        optimizer_state = None
+        scheduler_state = None
+
     logger.info(f"Parámetros totales: {model.num_params():,}")
 
-    # Dataloaders
+    # ── 4. Extensiones ──
+    extensions = args.extensions
+    if args.code_corpus and extensions == [".txt"]:
+        extensions = list(CODE_EXTENSIONS)
+        logger.info(f"Extensiones de código auto: {len(extensions)} tipos")
+
+    # ── 5. Reasoning layer ──
+    observer, graph = None, None
+    if not args.no_reasoning:
+        try:
+            observer, graph = build_reasoning_layer(
+                args.data, args.reasoning_chunk_size, logger,
+                enc_name="cl100k_base",
+                use_code=args.code_corpus,
+                extensions=extensions,
+            )
+            save_graph(graph, os.path.join(cfg.out_dir, "graph.pt"))
+            logger.info(f"Grafo guardado en {os.path.join(cfg.out_dir, 'graph.pt')}")
+        except Exception as e:
+            logger.warning(f"Razonamiento desactivado: {e}")
+            observer, graph = None, None
+
+    # ── 6. Dataloaders ──
     if cfg.use_rt:
         rv_ref = model.rv if hasattr(model, "rv") else model._orig_mod.rv
         train_dl, val_dl = make_rt_dataloader(
@@ -283,6 +305,7 @@ def main():
         )
     logger.info(f"Train batches/epoch: {len(train_dl)}, Val: {len(val_dl)}")
 
+    # ── 7. Train ──
     model = train(
         model, train_dl, val_dl, cfg, logger,
         start_step=start_step, optimizer=optimizer,
@@ -290,7 +313,7 @@ def main():
         best_val_loss=best_val_loss,
     )
 
-    # Guardar adapter LoRA si aplica
+    # ── 8. Guardar adapter LoRA ──
     if cfg.lora_enabled:
         save_lora(model, cfg.lora_path, extra={
             "step": int(cfg.max_steps),
@@ -300,7 +323,7 @@ def main():
         })
         logger.info(f"Adapter LoRA guardado en {cfg.lora_path}")
 
-    # Verificación final
+    # ── 9. Verificación final ──
     if graph is not None and observer is not None:
         logger.info("Verificación final...")
         text = generate(
