@@ -1,6 +1,7 @@
-"""SNN-LM v4.2: transformer GPT-2 con FFN de spikes binarios, memoria
-neural actualizable en training, abstracción geométrica, autoconocimiento
-y soporte RT."""
+"""SNN-LM v4.3: transformer con core configurable (attention|temporal),
+FFN híbrido, memoria neural, abstracción geométrica, autoconocimiento,
+y soporte RT + reasoning bias en generación.
+"""
 from __future__ import annotations
 
 import math
@@ -33,6 +34,7 @@ class SNNLM(nn.Module):
         if config.tie_weights:
             self.head.weight = self.tok_emb.weight
 
+        # RoPE solo se usa si core_type="attention"
         head_dim = config.n_embd // config.n_head
         cos, sin = precompute_rope(head_dim, max_len=config.seq_len)
         self.register_buffer("rope_cos", cos, persistent=False)
@@ -100,11 +102,24 @@ class SNNLM(nn.Module):
     def _forward(
         self,
         idx=None,
-        kv_caches=None,
+        state=None,
         start_pos: int = 0,
         update_memory: Optional[bool] = None,
         precomputed_embeddings: Optional[torch.Tensor] = None,
     ):
+        """Forward interno.
+
+        Args:
+            idx: (B, T) token IDs (o None si precomputed_embeddings).
+            state: 
+                - None -> no state tracking (training). Devuelve new_states=None.
+                - list -> track; para core_type="temporal", cada elemento es
+                  (B, inner_dim) o None. Para core_type="attention", cada
+                  elemento es (k,v) o None.
+            start_pos: solo para core_type="attention".
+            update_memory: None -> self.training; True/False -> forzar.
+            precomputed_embeddings: (B, T, C) si RT.
+        """
         if precomputed_embeddings is not None:
             x = self.drop(precomputed_embeddings)
         elif idx is not None:
@@ -112,14 +127,18 @@ class SNNLM(nn.Module):
         else:
             raise ValueError("Either idx or precomputed_embeddings required")
 
-        new_kv_caches = [] if kv_caches is not None else None
-        for i, block in enumerate(self.blocks):
-            kv = kv_caches[i] if kv_caches is not None else None
-            x, new_kv = block(x, self.rope_cos, self.rope_sin, kv, start_pos)
-            if new_kv_caches is not None:
-                new_kv_caches.append(new_kv)
+        track_state = state is not None
+        new_states = [] if track_state else None
 
-        # `update_memory=None` -> cada submódulo usa `self.training`.
+        for i, block in enumerate(self.blocks):
+            s = state[i] if track_state else None
+            x, new_s = block(
+                x, state=s,
+                cos=self.rope_cos, sin=self.rope_sin, start_pos=start_pos,
+            )
+            if track_state:
+                new_states.append(new_s)
+
         if self.neural_memory is not None:
             x = self.neural_memory(x, update=update_memory)
 
@@ -129,7 +148,6 @@ class SNNLM(nn.Module):
 
         vq_loss = None
         if self.abstraction_head is not None:
-            # ── FIX v4.2: VQ loss sobre x PRE-residual, no post ──
             x_pre = x
             quantized, _ = self.abstraction_head(x_pre, update=update_memory)
             if self.training:
@@ -139,19 +157,19 @@ class SNNLM(nn.Module):
 
         hidden = self.ln_f(x)
         logits = self.head(hidden)
-        return logits, new_kv_caches, vq_loss, hidden
+        return logits, new_states, vq_loss, hidden
 
     def forward(
         self,
         idx=None,
         targets=None,
-        kv_caches=None,
+        state=None,
         start_pos: int = 0,
         update_memory: Optional[bool] = None,
         precomputed_embeddings: Optional[torch.Tensor] = None,
     ):
-        logits, new_kv_caches, vq_loss, hidden = self._forward(
-            idx, kv_caches, start_pos, update_memory, precomputed_embeddings,
+        logits, new_states, vq_loss, hidden = self._forward(
+            idx, state, start_pos, update_memory, precomputed_embeddings,
         )
 
         loss = None
@@ -177,8 +195,8 @@ class SNNLM(nn.Module):
                 sk_loss = SelfKnowledgeHead.compute_loss(sk, logits, targets)
                 loss = loss + self.config.self_knowledge_loss_weight * sk_loss
 
-        if kv_caches is not None:
-            return logits, loss, new_kv_caches
+        if state is not None:
+            return logits, loss, new_states
         return logits, loss
 
     def get_last_self_knowledge(self) -> Optional[torch.Tensor]:
@@ -226,9 +244,11 @@ class SNNLM(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
         top_p: float | None = None,
-        use_cache: bool = True,
-        update_memory: bool = False,  # ── FIX: default seguro para producción ──
+        use_cache: bool = True,          # ignorado si core_type="temporal"
+        update_memory: bool = False,
+        reasoning_bias=None,             # ReasoningBias | None
     ) -> torch.Tensor:
+        """Genera texto. Si `reasoning_bias` se pasa, sesga logits por token."""
         self.eval()
         if max_new_tokens <= 0:
             return idx
@@ -237,22 +257,35 @@ class SNNLM(nn.Module):
         if idx.size(1) > seq_len:
             idx = idx[:, -seq_len:]
 
-        if (
-            use_cache
-            and self.config.use_spiking
-            and self.config.snn_mode == "temporal"
-        ):
-            use_cache = False
+        # TemporalCore: state siempre; Attention: KV-cache.
+        use_state = self.config.core_type == "temporal"
+        use_kv = (
+            (not use_state)
+            and use_cache
+            and not (self.config.use_spiking and self.config.snn_mode == "temporal")
+        )
 
-        if use_cache and idx.size(1) < seq_len:
+        if use_state:
+            states = [None] * len(self.blocks)
+            logits, _, _, _ = self._forward(
+                idx, state=states, update_memory=update_memory,
+            )
+            # Necesitamos los nuevos states reales
+            # Rehacemos con tracking devuelto:
+            # (Se podría optimizar, pero para claridad dejamos un paso extra.)
+            logits, states, _, _ = self._forward(
+                idx, state=[None] * len(self.blocks),
+                update_memory=update_memory,
+            )
+            pos = idx.size(1)
+        elif use_kv and idx.size(1) < seq_len:
             kv_caches = [None] * len(self.blocks)
             logits, _, _ = self(
-                idx, kv_caches=kv_caches, start_pos=0,
+                idx, state=kv_caches, start_pos=0,
                 update_memory=update_memory,
             )
             pos = idx.size(1)
         else:
-            use_cache = False
             kv_caches = None
             logits, _ = self(idx, update_memory=update_memory)
             pos = idx.size(1)
@@ -260,20 +293,36 @@ class SNNLM(nn.Module):
         logits = logits[:, -1, :]
 
         for step in range(max_new_tokens):
-            idx_next = self._sample_next(logits, temperature, top_k, top_p)
+            # Reasoning bias (solo afecta sampling, no la actualización de estado)
+            biased = logits
+            if reasoning_bias is not None:
+                biased = logits.clone()
+                reasoning_bias.apply(biased, step=step)
+
+            idx_next = self._sample_next(biased, temperature, top_k, top_p)
             idx = torch.cat([idx, idx_next], dim=1)
+
+            if reasoning_bias is not None:
+                reasoning_bias.observe_token(int(idx_next.item()))
+
             if step == max_new_tokens - 1:
                 break
 
-            if use_cache and pos + 1 <= seq_len:
+            if use_state:
+                logits, _, states = self(
+                    idx_next, state=states, update_memory=update_memory,
+                )
+                pos += 1
+                logits = logits[:, -1, :]
+            elif use_kv and pos + 1 <= seq_len:
                 logits, _, kv_caches = self(
-                    idx_next, kv_caches=kv_caches, start_pos=pos,
+                    idx_next, state=kv_caches, start_pos=pos,
                     update_memory=update_memory,
                 )
                 pos += 1
                 logits = logits[:, -1, :]
             else:
-                use_cache = False
+                use_kv = False
                 kv_caches = None
                 logits, _ = self(
                     idx[:, -seq_len:], update_memory=update_memory,
