@@ -1,5 +1,6 @@
-"""SNN-LM v4.1: transformer GPT-2 con FFN de spikes, memoria neural,
-abstracción geométrica, autoconocimiento y soporte RT."""
+"""SNN-LM v4.2: transformer GPT-2 con FFN de spikes binarios, memoria
+neural actualizable en training, abstracción geométrica, autoconocimiento
+y soporte RT."""
 from __future__ import annotations
 
 import math
@@ -104,7 +105,6 @@ class SNNLM(nn.Module):
         update_memory: Optional[bool] = None,
         precomputed_embeddings: Optional[torch.Tensor] = None,
     ):
-        # ── CAMBIO RT: usar embeddings precomputados si se dan ──
         if precomputed_embeddings is not None:
             x = self.drop(precomputed_embeddings)
         elif idx is not None:
@@ -119,6 +119,7 @@ class SNNLM(nn.Module):
             if new_kv_caches is not None:
                 new_kv_caches.append(new_kv)
 
+        # `update_memory=None` -> cada submódulo usa `self.training`.
         if self.neural_memory is not None:
             x = self.neural_memory(x, update=update_memory)
 
@@ -128,11 +129,13 @@ class SNNLM(nn.Module):
 
         vq_loss = None
         if self.abstraction_head is not None:
-            quantized, _ = self.abstraction_head(x, update=update_memory)
-            x = x + self.config.abstraction_residual_scale * quantized
+            # ── FIX v4.2: VQ loss sobre x PRE-residual, no post ──
+            x_pre = x
+            quantized, _ = self.abstraction_head(x_pre, update=update_memory)
             if self.training:
-                z = self.abstraction_head.proj(x)
+                z = self.abstraction_head.proj(x_pre)
                 vq_loss = F.mse_loss(z, quantized.detach())
+            x = x_pre + self.config.abstraction_residual_scale * quantized
 
         hidden = self.ln_f(x)
         logits = self.head(hidden)
@@ -165,7 +168,6 @@ class SNNLM(nn.Module):
                 self.self_knowledge_head is not None
                 and self.config.self_knowledge_loss_weight > 0
             ):
-                # ── CAMBIO RT: usar embeddings precomputados si están ──
                 if precomputed_embeddings is not None:
                     concept_emb = precomputed_embeddings
                 else:
@@ -225,7 +227,7 @@ class SNNLM(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         use_cache: bool = True,
-        update_memory: bool = True,
+        update_memory: bool = False,  # ── FIX: default seguro para producción ──
     ) -> torch.Tensor:
         self.eval()
         if max_new_tokens <= 0:
@@ -244,7 +246,6 @@ class SNNLM(nn.Module):
 
         if use_cache and idx.size(1) < seq_len:
             kv_caches = [None] * len(self.blocks)
-            # ── FIX: forward devuelve 3 valores, no 4 ──
             logits, _, _ = self(
                 idx, kv_caches=kv_caches, start_pos=0,
                 update_memory=update_memory,
@@ -265,7 +266,6 @@ class SNNLM(nn.Module):
                 break
 
             if use_cache and pos + 1 <= seq_len:
-                # ── FIX: forward devuelve 3 valores, no 4 ──
                 logits, _, kv_caches = self(
                     idx_next, kv_caches=kv_caches, start_pos=pos,
                     update_memory=update_memory,
