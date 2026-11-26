@@ -6,7 +6,7 @@ services:
     image: snnlm-v43:latest
     container_name: snnlm-dashboard
     ports:
-      - "127.0.0.1:8000:8000"   # solo localhost; usa Nginx/Caddy delante si expones
+      - "8000:8000"   # solo localhost; usa Nginx/Caddy delante si expones
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
