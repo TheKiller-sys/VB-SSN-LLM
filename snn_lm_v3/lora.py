@@ -1,9 +1,11 @@
-"""LoRA (Low-Rank Adaptation) para SNN-LM.
+"""LoRA (Low-Rank Adaptation) para SNN-LM v4.3.
 
-FIX v4.2.1:
-  - Todas las funciones públicas hacen `_unwrap(model)` al entrar, para
-    soportar modelos compilados con `torch.compile` (`OptimizedModule`).
-  - `load_lora` avisa si el `r` del adapter no coincide con el del modelo.
+v4.3:
+  - `apply_lora` con targets que cubren attention (`qkv`, `proj`), temporal
+    (`in_proj`, `out_proj`), dense FFN (`fc1`, `fc2`) y hybrid (`fc1_spike`).
+  - `_detect_default_targets(model)` inspecciona el modelo y devuelve los
+    targets relevantes para su core_type/ffn_mode.
+  - `_unwrap(model)` en todas las funciones públicas (soporta `torch.compile`).
 """
 from __future__ import annotations
 
@@ -50,12 +52,10 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / r
 
-        # A: (in, r), B: (r, out). W_eff = W + (A @ B) * scaling
         self.lora_A = nn.Parameter(torch.empty(in_f, r))
         self.lora_B = nn.Parameter(torch.zeros(r, out_f))
 
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        # B = 0 → forward inicial == base
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
@@ -65,7 +65,6 @@ class LoRALinear(nn.Module):
         return base_out + lora_out.to(base_out.dtype)
 
     def merged_weight(self) -> torch.Tensor:
-        """W + (A @ B) * scaling. No muta el módulo."""
         delta = (self.lora_A @ self.lora_B) * self.scaling
         return self.base.weight + delta.T
 
@@ -77,11 +76,35 @@ class LoRALinear(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Targets
+# ─────────────────────────────────────────────────────────────────────
+
+# Defaults v4.3: cubren attention (qkv, proj), temporal (in_proj, out_proj),
+# dense FFN (fc1, fc2) y hybrid (fc1_spike).
+DEFAULT_LORA_TARGETS: tuple[str, ...] = (
+    "qkv", "proj",
+    "in_proj", "out_proj",
+    "fc1", "fc2", "fc1_spike",
+)
+
+
+def _detect_default_targets(model) -> tuple[str, ...]:
+    """Devuelve los targets presentes en el modelo (no falla si alguno no existe)."""
+    model = _unwrap(model)
+    found: set[str] = set()
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear) and not isinstance(module, LoRALinear):
+            short = name.rsplit(".", 1)[-1]
+            if short in DEFAULT_LORA_TARGETS:
+                found.add(short)
+    return tuple(sorted(found))
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Helpers de reemplazo
 # ─────────────────────────────────────────────────────────────────────
 
 def _set_submodule(root: nn.Module, dotted_name: str, new_module: nn.Module) -> None:
-    """Reemplaza root.<dotted_name> por new_module."""
     if "." in dotted_name:
         parent_name, _, attr = dotted_name.rpartition(".")
         parent = root.get_submodule(parent_name)
@@ -96,15 +119,22 @@ def apply_lora(
     r: int = 8,
     alpha: float = 16.0,
     dropout: float = 0.0,
-    targets: Sequence[str] = ("qkv", "proj", "fc1", "fc2"),
+    targets: Sequence[str] | None = None,
     skip_prefixes: Sequence[str] = ("rv.", "tok_emb."),
 ) -> int:
-    """Envuelve cada `nn.Linear` cuyo último componente del nombre esté en `targets`.
+    """Envuelve cada `nn.Linear` cuyo último componente esté en `targets`.
 
-    FIX v4.2.1: hace `_unwrap(model)` al entrar, para soportar `OptimizedModule`.
-    El modelo se modifica in-place, por lo que la referencia original sigue siendo válida.
+    Si `targets=None`, se autodetectan con `_detect_default_targets`.
     """
     model = _unwrap(model)
+
+    if targets is None:
+        targets = _detect_default_targets(model)
+        if not targets:
+            raise ValueError(
+                "apply_lora found 0 Linear modules matching DEFAULT_LORA_TARGETS. "
+                "Model has no known target layers."
+            )
     if isinstance(targets, str):
         targets = (targets,)
     targets_set = set(targets)
@@ -129,14 +159,13 @@ def apply_lora(
     if not to_replace:
         raise ValueError(
             f"apply_lora found 0 modules matching targets={targets}. "
-            f"Check that the model has Linear layers named qkv/proj/fc1/fc2."
+            f"Model may not have the expected Linear layers."
         )
 
     return len(to_replace)
 
 
 def freeze_base_for_lora(model: nn.Module) -> int:
-    """Congela todo y reactiva solo `lora_A` y `lora_B`."""
     model = _unwrap(model)
     for p in model.parameters():
         p.requires_grad = False
@@ -149,7 +178,6 @@ def freeze_base_for_lora(model: nn.Module) -> int:
 
 
 def lora_parameters(model: nn.Module) -> Iterable[nn.Parameter]:
-    """Itera solo los parámetros LoRA (A, B)."""
     model = _unwrap(model)
     for name, p in model.named_parameters():
         if ".lora_A" in name or ".lora_B" in name:
@@ -161,10 +189,6 @@ def count_lora_params(model: nn.Module) -> int:
 
 
 def lora_state_dict(model: nn.Module) -> dict:
-    """Devuelve {nombre_módulo: {A, B, r, alpha}} para todos los LoRALinear.
-
-    FIX v4.2.1: hace `_unwrap(model)` para que los nombres no lleven `_orig_mod.`.
-    """
     model = _unwrap(model)
     out: dict = {}
     for name, module in model.named_modules():
@@ -179,10 +203,6 @@ def lora_state_dict(model: nn.Module) -> dict:
 
 
 def load_lora_state_dict(model: nn.Module, state: dict) -> int:
-    """Carga A, B desde `lora_state_dict`. Devuelve número de módulos cargados.
-
-    FIX v4.2.1: hace `_unwrap(model)` al entrar.
-    """
     model = _unwrap(model)
     model_lora = {
         n: m for n, m in model.named_modules() if isinstance(m, LoRALinear)
@@ -222,17 +242,13 @@ def load_lora_state_dict(model: nn.Module, state: dict) -> int:
 
 
 def save_lora(model: nn.Module, path: str, extra: dict | None = None) -> None:
-    """Guarda solo A, B + metadata. No guarda pesos base.
-
-    FIX v4.2.1: hace `_unwrap(model)` para que los nombres no lleven `_orig_mod.`.
-    """
     model = _unwrap(model)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     state = lora_state_dict(model)
     if not state:
         raise ValueError("save_lora: model has no LoRALinear modules.")
     payload = {
-        "version": 1,
+        "version": 2,  # bumped: v4.3 targets
         "lora_state": state,
         "extra": extra or {},
     }
@@ -242,25 +258,16 @@ def save_lora(model: nn.Module, path: str, extra: dict | None = None) -> None:
 
 
 def load_lora(model: nn.Module, path: str) -> dict:
-    """Carga A, B en un modelo que YA tiene LoRA aplicado.
-
-    Returns:
-        Metadata `extra` guardada con `save_lora`.
-    """
     model = _unwrap(model)
     payload = torch.load(path, map_location="cpu", weights_only=False)
     version = payload.get("version", 0)
-    if version != 1:
-        raise ValueError(f"LoRA format version {version} != 1")
+    if version not in (1, 2):
+        raise ValueError(f"LoRA format version {version} not supported (1, 2)")
     load_lora_state_dict(model, payload["lora_state"])
     return payload.get("extra", {})
 
 
 def merge_lora(model: nn.Module) -> int:
-    """Funde A @ B en los pesos base. Destructivo: reemplaza LoRALinear por Linear.
-
-    FIX v4.2.1: hace `_unwrap(model)` al entrar.
-    """
     model = _unwrap(model)
     to_merge: list[tuple[str, LoRALinear]] = [
         (n, m) for n, m in model.named_modules() if isinstance(m, LoRALinear)
@@ -273,10 +280,6 @@ def merge_lora(model: nn.Module) -> int:
 
 
 def is_lora_active(model: nn.Module) -> bool:
-    """True si el modelo tiene al menos un LoRALinear.
-
-    FIX v4.2.1: hace `_unwrap(model)` para mirar el módulo real.
-    """
     model = _unwrap(model)
     for m in model.modules():
         if isinstance(m, LoRALinear):
