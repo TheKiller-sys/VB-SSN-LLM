@@ -1,15 +1,20 @@
 """Consulta el grafo de razonamiento sin generar texto.
 
+Sin cambios respecto a v4.2.1: el grafo es independiente del core.
+
 Ejemplos:
-    snnlm-reason --graph checkpoints/graph.pt --stats
-    snnlm-reason --graph checkpoints/graph.pt --apply "quick" "fox" "lazy"
-    snnlm-reason --corpus data/ --mine --save checkpoints/graph.pt
+    python scripts/reason.py --graph checkpoints/graph.pt --stats
+    python scripts/reason.py --graph checkpoints/graph.pt --apply "quick" "fox" "lazy"
+    python scripts/reason.py --corpus data/ --mine --save checkpoints/graph.pt
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from snn_lm_v4 import (
     load_texts,
