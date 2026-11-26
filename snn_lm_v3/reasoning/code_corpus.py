@@ -1,21 +1,14 @@
 """CodeCorpusObserver: razonamiento simbólico sobre CÓDIGO.
 
-Diferencias con CorpusObserver (prosa):
-  - Tokeniza con regex de código (operadores, keywords, strings).
-  - Ignora comentarios (ruido semántico).
-  - Delays en transiciones medidos en TOKENS, no en caracteres.
-  - Preserva operadores estructurales: `{ → }`, `def → ident`, `if → (`.
-
-Compatibilidad total:
-  - Misma API que CorpusObserver.
-  - ReasoningGraph.mine_from_corpus(observer) funciona sin cambios.
+FIX v4.2.1:
+  - `candidate_transitions()` excluye pares con `<string>` / `<docstr>`
+    (reglas semánticamente vacías).
 """
 from __future__ import annotations
 
-import math
 import re
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 
 from .corpus import (
@@ -29,7 +22,6 @@ from .corpus import (
 # Regex de tokenización de código
 # ─────────────────────────────────────────────────────────────
 
-# Operadores multi-char (más largos primero para evitar fragmentación)
 MULTI_CHAR_OPS = [
     "===", "!==", ">>>", "<<=", ">>=", "**=", "//=", "->", "=>", "::",
     "==", "!=", "<=", ">=", "&&", "||", "++", "--", "+=", "-=", "*=",
@@ -51,10 +43,6 @@ _CODE_TOKEN_RE = re.compile(
 )
 
 
-# ─────────────────────────────────────────────────────────────
-# Transición tipada para código
-# ─────────────────────────────────────────────────────────────
-
 @dataclass
 class CodeTransition:
     a: str
@@ -73,38 +61,21 @@ class CodeTransition:
         return sum(self.delays) / len(self.delays) if self.delays else 0.0
 
 
-# ─────────────────────────────────────────────────────────────
-# Observer
-# ─────────────────────────────────────────────────────────────
-
 class CodeCorpusObserver(CorpusObserver):
-    """Observa código: operadores, keywords, identificadores, strings.
+    """Observa código: operadores, keywords, identificadores, strings."""
 
-    Uso:
-        obs = CodeCorpusObserver()
-        for chunk in code_chunks:
-            obs.observe(chunk)
-        graph = ReasoningGraph(cooldown_steps=3)
-        graph.mine_from_corpus(obs)
-    """
-
-    # Ventana de co-ocurrencia (en tokens). Código tiene estructura local
-    # muy densa: `def → ident`, `ident → (`, `( → ident`, `) → :`.
     TRANSITION_WINDOW = 8
-
-    # Umbrales adaptados a código (keywords aparecen MUCHO más que en prosa)
     MIN_SYMBOL_OCCURRENCES = 3
     MIN_RULE_COUNT = 3
 
+    _GENERIC_TOKENS = frozenset(("<string>", "<docstr>"))
+
     def __init__(self, enc_name: str = "cl100k_base"):
         super().__init__(enc_name=enc_name)
-        # Reemplazar dict de transiciones por el tipado de código
         self.transitions: dict[tuple[str, str], CodeTransition] = {}
 
     # ---------------------------------------------------------- tokenización
     def tokenize(self, text: str) -> list[str]:
-        """Tokeniza código. Comentarios descartados, strings/docstrings
-        colapsados a un token único, operadores y keywords preservados."""
         if not text:
             return []
 
@@ -166,7 +137,6 @@ class CodeCorpusObserver(CorpusObserver):
 
     # ---------------------------------------------------------- transiciones
     def _record_transitions(self, text: str, tokens: list[str]) -> None:
-        """Registra (A, B) con delay en TOKENS dentro de ventana local."""
         seen: set[tuple[str, str]] = set()
         n = len(tokens)
 
@@ -191,18 +161,20 @@ class CodeCorpusObserver(CorpusObserver):
 
     # ---------------------------------------------------------- símbolos
     def candidate_symbols(self) -> list[tuple[str, int]]:
-        """Tokens significativos (excluye strings/docstrings genéricos)."""
         return [
             (t, c) for t, c in self.vocabulary.items()
             if c >= self.MIN_SYMBOL_OCCURRENCES
-            and t not in ("<string>", "<docstr>")
+            and t not in self._GENERIC_TOKENS
         ]
 
     def candidate_transitions(self) -> list[tuple[str, str, int]]:
+        # FIX v4.2.1: filtrar pares con strings/docstrings genéricos
         return [
             (a, b, tr.count)
             for (a, b), tr in self.transitions.items()
             if tr.count >= self.MIN_RULE_COUNT
+            and a not in self._GENERIC_TOKENS
+            and b not in self._GENERIC_TOKENS
         ]
 
     # ---------------------------------------------------------- estado
