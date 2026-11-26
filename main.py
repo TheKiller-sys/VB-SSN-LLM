@@ -1,5 +1,4 @@
-"""
-Demo end-to-end: genera corpus sintético, entrena, evalúa, razona y genera.
+"""Demo end-to-end: genera corpus sintético, entrena, evalúa, razona y genera.
 
     python main.py
     python main.py --size small --steps 1000 --device cuda
@@ -12,7 +11,7 @@ import logging
 import os
 import tempfile
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     GPTConfig, SIZES, SNNLM, make_dataloader, train, evaluate, generate,
     resolve_device,
     CorpusObserver, ReasoningGraph, ConsistencyVerifier,
@@ -50,7 +49,6 @@ def main():
         with open(os.path.join(data_dir, "demo.txt"), "w", encoding="utf-8") as f:
             f.write(DEMO)
 
-        # ---------------- razonamiento sobre corpus ----------------
         observer, graph = None, None
         if not args.no_reasoning:
             observer = CorpusObserver(enc_name="gpt2")
@@ -67,7 +65,6 @@ def main():
                 f"{graph.get_state()['rules_count']} totales"
             )
 
-        # ---------------- modelo ----------------
         cfg = GPTConfig(
             **SIZES[args.size],
             seq_len=128,
@@ -101,7 +98,6 @@ def main():
         metrics = evaluate(model, val_dl, device)
         logger.info(f"Eval final: {metrics}")
 
-        # ---------------- generación + verificación ----------------
         text = generate(
             model,
             prompt="The quick brown",
@@ -124,4 +120,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
