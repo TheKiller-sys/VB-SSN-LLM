@@ -1,7 +1,10 @@
 """Configuración completa del modelo, validación y resolución de device.
 
-FIX v4.2.1:
-  - Valida `rag_encoder` y `lora_targets`.
+v4.3:
+  - Añade `core_type` ("attention" | "temporal") con TemporalCore.
+  - Añade parámetros de TemporalCore (expand, LIF decay, chunk).
+  - Añade `ffn_mode` ("dense" | "spiking" | "hybrid") con FFN híbrido.
+  - Añade `reasoning_bias_*` para bias de reglas en logits.
 """
 from __future__ import annotations
 
@@ -38,6 +41,19 @@ class GPTConfig:
     tie_weights: bool = True
     init_std: float = 0.02
 
+    # ---- core (v4.3) ----
+    core_type: str = "temporal"  # "attention" | "temporal"
+
+    # ---- TemporalCore (v4.3) ----
+    temporal_expand: int = 2
+    temporal_lif_threshold: float = 1.0
+    temporal_lif_decay: float = 0.9
+    temporal_lif_alpha: float = 2.0
+    temporal_chunk_size: int = 64
+    temporal_use_spike_decay: bool = True
+    temporal_decay_base: float = 0.9
+    temporal_decay_target: float = 0.99
+
     # ---- Resonant Tokenizer (v4.1) ----
     use_rt: bool = False
     rt_bpe_vocab_size: int = 40_000
@@ -50,7 +66,9 @@ class GPTConfig:
     rt_min_count_for_update: float = 0.1
     rt_concept_top_k_tokens: int = 8
 
-    # ---- FFN de spikes ----
+    # ---- FFN ----
+    ffn_mode: str = "hybrid"  # "dense" | "spiking" | "hybrid" (v4.3)
+    ffn_hybrid_spike_gate_init: float = 0.5  # sigmoide inversa => gate ~0.62
     use_spiking: bool = True
     spiking_mult: int = 4
     spiking_threshold: float = 1.0
@@ -106,15 +124,27 @@ class GPTConfig:
     rag_kb_path: str = ""
     rag_top_k: int = 4
     rag_max_context_chars: int = 2000
-    rag_encoder: str = "hidden"  # "hidden" | "sentence_transformer:<name>"
+    rag_encoder: str = "hidden"
 
     # ---- LoRA (v4.2) ----
     lora_enabled: bool = False
     lora_r: int = 8
     lora_alpha: float = 16.0
     lora_dropout: float = 0.0
-    lora_targets: list = field(default_factory=lambda: ["qkv", "proj", "fc1", "fc2"])
+    lora_targets: list = field(
+        default_factory=lambda: ["qkv", "proj", "fc1", "fc2"]
+    )
     lora_path: str = ""
+
+    # ---- Reasoning bias (v4.3) ----
+    reasoning_bias_enabled: bool = False
+    reasoning_bias_strength: float = 0.1
+    reasoning_bias_top_k: int = 16
+    reasoning_bias_remine_every: int = 8
+    reasoning_bias_facts_window: int = 8
+    reasoning_bias_min_confidence: float = 0.5
+    reasoning_mapper_path: str = "checkpoints/symbol_mapper.pt"
+    reasoning_graph_path: str = "checkpoints/graph.pt"
 
     # ---- entrenamiento ----
     batch_size: int = 8
@@ -191,7 +221,6 @@ class GPTConfig:
              "n_embd must be divisible by latent_reasoner_heads"),
             (self.latent_reasoner_layers >= 1, "latent_reasoner_layers must be >= 1"),
             (self.analyzer_interval_s > 0, "analyzer_interval_s must be > 0"),
-            # RT
             (self.rt_bpe_vocab_size >= 2, "rt_bpe_vocab_size must be >= 2"),
             (self.rt_n_concepts >= 2, "rt_n_concepts must be >= 2"),
             (self.rt_concept_dim > 0, "rt_concept_dim must be > 0"),
@@ -201,7 +230,6 @@ class GPTConfig:
             (self.rt_min_count_for_update >= 0, "rt_min_count_for_update must be >= 0"),
             (self.rt_concept_top_k_tokens >= 1, "rt_concept_top_k_tokens must be >= 1"),
             (self.split_by in ("file", "repo"), f"invalid split_by: {self.split_by}"),
-            # RAG
             (self.rag_top_k >= 1, "rag_top_k must be >= 1"),
             (self.rag_max_context_chars >= 0, "rag_max_context_chars must be >= 0"),
             (
@@ -209,7 +237,6 @@ class GPTConfig:
                 or self.rag_encoder.startswith("sentence_transformer:"),
                 f"invalid rag_encoder: {self.rag_encoder!r}",
             ),
-            # LoRA
             (self.lora_r > 0, "lora_r must be > 0"),
             (self.lora_alpha > 0, "lora_alpha must be > 0"),
             (0.0 <= self.lora_dropout < 1.0, "lora_dropout must be in [0, 1)"),
@@ -217,6 +244,33 @@ class GPTConfig:
                 not self.lora_enabled or len(self.lora_targets) > 0,
                 "lora_targets must be non-empty when lora_enabled=True",
             ),
+            # ---- v4.3 ----
+            (self.core_type in ("attention", "temporal"),
+             f"invalid core_type: {self.core_type}"),
+            (self.temporal_expand >= 1, "temporal_expand must be >= 1"),
+            (self.temporal_lif_threshold > 0,
+             "temporal_lif_threshold must be > 0"),
+            (0.0 < self.temporal_lif_decay < 1.0,
+             "temporal_lif_decay must be in (0,1)"),
+            (self.temporal_lif_alpha > 0, "temporal_lif_alpha must be > 0"),
+            (self.temporal_chunk_size >= 1, "temporal_chunk_size must be >= 1"),
+            (0.0 < self.temporal_decay_base < 1.0,
+             "temporal_decay_base must be in (0,1)"),
+            (0.0 < self.temporal_decay_target < 1.0,
+             "temporal_decay_target must be in (0,1)"),
+            (self.ffn_mode in ("dense", "spiking", "hybrid"),
+             f"invalid ffn_mode: {self.ffn_mode}"),
+            (0.0 <= self.ffn_hybrid_spike_gate_init <= 1.0,
+             "ffn_hybrid_spike_gate_init must be in [0,1]"),
+            (self.reasoning_bias_strength >= 0,
+             "reasoning_bias_strength must be >= 0"),
+            (self.reasoning_bias_top_k >= 1, "reasoning_bias_top_k must be >= 1"),
+            (self.reasoning_bias_remine_every >= 1,
+             "reasoning_bias_remine_every must be >= 1"),
+            (self.reasoning_bias_facts_window >= 1,
+             "reasoning_bias_facts_window must be >= 1"),
+            (0.0 <= self.reasoning_bias_min_confidence <= 1.0,
+             "reasoning_bias_min_confidence must be in [0,1]"),
         ]
         for ok, msg in checks:
             if not ok:
@@ -258,6 +312,20 @@ class GPTConfig:
         if self.rag_enabled and not self.rag_kb_path:
             warnings.warn(
                 "rag_enabled=True but rag_kb_path is empty. RAG will be no-op.",
+                RuntimeWarning, stacklevel=3,
+            )
+        if self.core_type == "temporal" and self.snn_mode == "temporal":
+            warnings.warn(
+                "core_type='temporal' + snn_mode='temporal': doble recurrencia. "
+                "Considera snn_mode='static' o 'multi_step' para el FFN.",
+                RuntimeWarning, stacklevel=3,
+            )
+        if self.reasoning_bias_enabled and not os.path.exists(
+            self.reasoning_mapper_path
+        ):
+            warnings.warn(
+                f"reasoning_bias_enabled=True but mapper not found at "
+                f"{self.reasoning_mapper_path!r}. Bias will be no-op.",
                 RuntimeWarning, stacklevel=3,
             )
 
