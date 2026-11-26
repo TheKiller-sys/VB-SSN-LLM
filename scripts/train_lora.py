@@ -1,11 +1,8 @@
 """Fine-tuning incremental con LoRA.
 
-Congela el modelo base y entrena solo adaptadores A, B.
-Persiste los adaptadores en `--out` (default: checkpoints/lora.pt).
-
-Ejemplo:
-    python scripts/train_lora.py data/nuevo/ --base checkpoints/best.pt \\
-        --out checkpoints/lora_nuevo.pt --r 8 --alpha 16 --max-steps 2000
+FIX v4.2.1:
+  - Eliminado import muerto `CODE_EXTENSIONS`.
+  - Paquete renombrado a `snn_lm_v4`.
 """
 from __future__ import annotations
 
@@ -18,12 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     SNNLM, GPTConfig, make_dataloader, make_rt_dataloader,
     train, resolve_device, load_checkpoint,
     apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
 )
-from snn_lm_v3.dataset import CODE_EXTENSIONS
 
 
 def parse_args():
@@ -64,7 +60,6 @@ def main():
     device = resolve_device(args.device)
     logger.info(f"Device: {device}")
 
-    # Cargar base
     logger.info(f"Cargando base desde {args.base}")
     ckpt = load_checkpoint(args.base, SNNLM, device, load_optimizer=False)
     model = ckpt["model"]
@@ -114,6 +109,7 @@ def main():
     # Dataloaders
     extensions = args.extensions
     if args.code_corpus and extensions == [".txt"]:
+        from snn_lm_v4.dataset import CODE_EXTENSIONS
         extensions = list(CODE_EXTENSIONS)
     use_rt = ckpt.get("use_rt", False)
     if use_rt:
@@ -132,10 +128,8 @@ def main():
         )
     logger.info(f"Train batches: {len(train_dl)}, Val: {len(val_dl)}")
 
-    # Entrenar (reutiliza el trainer estándar)
     model = train(model, train_dl, val_dl, cfg, logger)
 
-    # Guardar adapter (solo A, B)
     save_lora(model, args.out, extra={
         "base_ckpt": args.base,
         "step": int(cfg.max_steps),
