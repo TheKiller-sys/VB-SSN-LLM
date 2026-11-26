@@ -1,4 +1,8 @@
-"""Configuración completa del modelo, validación y resolución de device."""
+"""Configuración completa del modelo, validación y resolución de device.
+
+FIX v4.2.1:
+  - Valida `rag_encoder` y `lora_targets`.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
@@ -200,10 +204,19 @@ class GPTConfig:
             # RAG
             (self.rag_top_k >= 1, "rag_top_k must be >= 1"),
             (self.rag_max_context_chars >= 0, "rag_max_context_chars must be >= 0"),
+            (
+                self.rag_encoder == "hidden"
+                or self.rag_encoder.startswith("sentence_transformer:"),
+                f"invalid rag_encoder: {self.rag_encoder!r}",
+            ),
             # LoRA
             (self.lora_r > 0, "lora_r must be > 0"),
             (self.lora_alpha > 0, "lora_alpha must be > 0"),
             (0.0 <= self.lora_dropout < 1.0, "lora_dropout must be in [0, 1)"),
+            (
+                not self.lora_enabled or len(self.lora_targets) > 0,
+                "lora_targets must be non-empty when lora_enabled=True",
+            ),
         ]
         for ok, msg in checks:
             if not ok:
