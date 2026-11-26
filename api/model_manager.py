@@ -4,13 +4,13 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     SNNLM, load_checkpoint, resolve_device,
     SignalProbe, ConsistencyVerifier, ReasoningBias,
     TokenSymbolMapper, load_graph, KnowledgeBase,
     make_model_encoder, make_sentence_transformer_encoder,
 )
-from snn_lm_v4.generate import generate as _generate
+from snn_lm_v3.generate import generate as _generate
 
 
 class ModelManager:
@@ -118,7 +118,7 @@ class ModelManager:
                 verifier = ConsistencyVerifier()
                 problems.extend(verifier.verify(text, signals))
                 if self._graph is not None:
-                    from snn_lm_v4 import CorpusObserver
+                    from snn_lm_v3 import CorpusObserver
                     obs = CorpusObserver()
                     obs.observe(prompt, ref="prompt")
                     problems.extend(

@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     SNNLM, generate, resolve_device, load_texts,
     CorpusObserver, ReasoningGraph, ConsistencyVerifier,
     SignalProbe, load_graph,
@@ -21,7 +21,7 @@ from snn_lm_v4 import (
     apply_lora, load_lora, merge_lora, is_lora_active,
     TokenSymbolMapper, ReasoningBias,
 )
-from snn_lm_v4.checkpoint import load_checkpoint
+from snn_lm_v3.checkpoint import load_checkpoint
 
 
 def parse_args():

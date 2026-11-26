@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     SNNLM, make_dataloader, make_rt_dataloader,
     train, resolve_device, load_checkpoint,
     apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
@@ -114,7 +114,7 @@ def main():
     # Dataloaders
     extensions = args.extensions
     if args.code_corpus and extensions == [".txt"]:
-        from snn_lm_v4.dataset import CODE_EXTENSIONS
+        from snn_lm_v3.dataset import CODE_EXTENSIONS
         extensions = list(CODE_EXTENSIONS)
     use_rt = ckpt.get("use_rt", False)
     if use_rt:

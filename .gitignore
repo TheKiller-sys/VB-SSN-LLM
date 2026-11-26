@@ -1,0 +1,12 @@
+state/
+state.db
+state.db-wal
+state.db-shm
+logs/
+checkpoints/
+data/
+*.pt
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/

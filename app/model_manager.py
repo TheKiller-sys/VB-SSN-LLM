@@ -2,8 +2,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from snn_lm_v4 import SNNLM, load_checkpoint, resolve_device
-from snn_lm_v4.generate import generate as _generate
+from snn_lm_v3 import SNNLM, load_checkpoint, resolve_device
+from snn_lm_v3.generate import generate as _generate
 
 
 class ModelManager:

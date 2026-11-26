@@ -11,7 +11,7 @@ import logging
 import os
 import tempfile
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     GPTConfig, SIZES, SNNLM, make_dataloader, train, evaluate, generate,
     resolve_device,
     CorpusObserver, ReasoningGraph, ConsistencyVerifier,

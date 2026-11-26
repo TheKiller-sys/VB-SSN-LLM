@@ -11,13 +11,13 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./checkpoints:/app/checkpoints
-      - ./state.db:/app/state.db
+      - ./state:/app/state
     environment:
       # Rutas internas
       - SNNLM_DATA_ROOT=/app/data
       - SNNLM_CKPT_ROOT=/app/checkpoints
       - SNNLM_LOG_ROOT=/app/logs
-      - SNNLM_STATE_DB=/app/state.db
+      - SNNLM_STATE_DB=/app/state/state.db
       # Forzar CPU y limitar hilos (2 cores)
       - CUDA_VISIBLE_DEVICES=""
       - OMP_NUM_THREADS=2

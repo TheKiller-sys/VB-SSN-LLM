@@ -21,11 +21,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     SNNLM, KnowledgeBase, load_checkpoint, resolve_device,
     make_model_encoder, make_sentence_transformer_encoder,
 )
-from snn_lm_v4.dataset import load_texts_with_paths
+from snn_lm_v3.dataset import load_texts_with_paths
 
 
 def parse_args():

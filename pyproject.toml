@@ -28,7 +28,7 @@ snnlm-generate = "scripts.generate:main"
 snnlm-reason = "scripts.reason:main"
 
 [tool.setuptools.packages.find]
-include = ["snn_lm_v3*", "scripts*"]
+include = ["snn_lm_v3*", "api*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

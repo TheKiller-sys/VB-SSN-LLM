@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from snn_lm_v4 import (
+from snn_lm_v3 import (
     GPTConfig, SIZES, SNNLM,
     make_dataloader, make_rt_dataloader,
     train, resolve_device, load_texts_with_paths,
@@ -27,8 +27,8 @@ from snn_lm_v4 import (
     ResonantVocab, RVConfig, RTModelWrapper,
     apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
 )
-from snn_lm_v4.dataset import CODE_EXTENSIONS
-from snn_lm_v4.checkpoint import load_checkpoint
+from snn_lm_v3.dataset import CODE_EXTENSIONS
+from snn_lm_v3.checkpoint import load_checkpoint
 
 
 def parse_args():
@@ -278,7 +278,7 @@ def main():
         optimizer_state = ckpt.get("optimizer_state")
         scheduler_state = ckpt.get("scheduler_state")
         if optimizer_state is not None:
-            from snn_lm_v4.train import _build_optimizer
+            from snn_lm_v3.train import _build_optimizer
             optimizer = _build_optimizer(model, cfg, optimizer_state)
         else:
             optimizer = None

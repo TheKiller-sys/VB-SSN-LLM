@@ -15,7 +15,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn_lm_v4.tokenizer.bpe_trainer import train_bpe
+from snn_lm_v3.tokenizer.bpe_trainer import train_bpe
 
 
 def main():

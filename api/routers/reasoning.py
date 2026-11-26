@@ -12,7 +12,7 @@ router = APIRouter()
 def _load_graph_cached(request: Request, path: str):
     cache = request.app.state.graph_cache
     if path not in cache:
-        from snn_lm_v4 import load_graph
+        from snn_lm_v3 import load_graph
         cache[path] = load_graph(path)
     return cache[path]
 

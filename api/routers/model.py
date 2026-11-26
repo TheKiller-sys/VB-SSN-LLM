@@ -72,7 +72,7 @@ async def unload(request: Request):
 
 @router.post("/signals")
 async def signals(req: SignalsReq, request: Request):
-    from snn_lm_v4 import SignalProbe
+    from snn_lm_v3 import SignalProbe
     mgr = request.app.state.model
     if not mgr.info().get("loaded"):
         raise HTTPException(400, "No model loaded")
