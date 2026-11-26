@@ -6,8 +6,19 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./checkpoints:/app/checkpoints
       - ./state.db:/app/state.db
     environment:
       - CUDA_VISIBLE_DEVICES=0
-    restart: always
+      - SNNLM_DATA_ROOT=/app/data
+      - SNNLM_CKPT_ROOT=/app/checkpoints
+      - SNNLM_LOG_ROOT=/app/logs
+    restart: unless-stopped
     shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
