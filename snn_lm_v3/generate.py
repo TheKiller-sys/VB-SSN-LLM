@@ -1,8 +1,30 @@
-"""Wrapper de generación: detecta RT o usa tiktoken."""
+"""Wrapper de generación: detecta RT sin importar el módulo, evita fallbacks silenciosos."""
 from __future__ import annotations
 
 import torch
 import tiktoken
+
+
+def _unwrap(model):
+    seen: set[int] = set()
+    while hasattr(model, "_orig_mod") and id(model) not in seen:
+        seen.add(id(model))
+        model = model._orig_mod
+    return model
+
+
+def _is_rt_model(model) -> bool:
+    """Detecta RTModelWrapper sin importar `tokenizer` (funciona con torch.compile)."""
+    model = _unwrap(model)
+    if model.__class__.__name__ == "RTModelWrapper":
+        return True
+    # Fallback: chequeo estructural (por si el nombre cambió)
+    return (
+        hasattr(model, "rv")
+        and hasattr(model, "snnlm")
+        and hasattr(model.rv, "encode")
+        and hasattr(model.rv, "decode")
+    )
 
 
 @torch.no_grad()
@@ -24,12 +46,7 @@ def generate(
     if seed is not None:
         torch.manual_seed(seed)
 
-    # Detectar RT
-    try:
-        from .tokenizer import RTModelWrapper
-        is_rt = isinstance(model, RTModelWrapper)
-    except ImportError:
-        is_rt = False
+    is_rt = _is_rt_model(model)
 
     if is_rt:
         ids = model.encode(prompt) if prompt else [0]
