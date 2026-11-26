@@ -1,21 +1,16 @@
-"""Tokenizer Resonante: BPE (via `tokenizers`) + codebook VQ acoplado.
+"""Tokenizer Resonante: BPE + codebook VQ acoplado.
 
-- `encode(text) -> list[int]` (BPE reversible)
-- `decode(ids) -> str` (BPE reversible)
-- `embed(ids) -> [B,T,D]` (embedding aprendido)
-- `quantize(emb) -> (quantized_emb, concept_ids, aux_loss)` (VQ con straight-through)
-- `embed_and_quantize(ids, update=True) -> (quantized_emb, concept_ids, aux_loss)`
-
-El codebook se actualiza con EMA vectorizado (sin bucles Python por nodo).
-El mapa `concept_to_tokens` (top-K tokens BPE por concepto) permite
-decodificación conceptual e introspección.
-
-Todo es determinista. Sin `torch.rand` en updates.
+- `encode/decode`: BPE reversible.
+- `embed_and_quantize`: BPE embed → VQ → straight-through → expander.
+- `update_codebook`: EMA vectorizado (O(K) memoria, sin loops por nodo).
+- `update_concept_to_tokens`: top-K tokens por concepto (O(N log N), sin loops
+  O(K·N)).
+- `reinit_dead_codes`: no determinista (usa randint/randn); solo lo llama el
+  `ContinuousAnalyzer`, nunca el training loop.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional
 
 import torch
@@ -41,17 +36,12 @@ class ResonantVocab(nn.Module):
     def __init__(self, cfg: RVConfig, bpe_tokenizer):
         super().__init__()
         self.cfg = cfg
-        self.bpe = bpe_tokenizer  # `tokenizers.Tokenizer`
+        self.bpe = bpe_tokenizer
 
-        # Embedding aprendido (reemplaza al tok_emb clásico)
         self.tok_emb = nn.Embedding(cfg.bpe_vocab_size, cfg.embedding_dim)
-
-        # Proyección al espacio de conceptos
         self.projector = nn.Linear(cfg.embedding_dim, cfg.concept_dim, bias=False)
-        # Proyección de vuelta al espacio de embedding
         self.expander = nn.Linear(cfg.concept_dim, cfg.embedding_dim, bias=False)
 
-        # Codebook VQ (buffers, no params; actualizado vía EMA)
         self.register_buffer(
             "codebook", torch.randn(cfg.n_concepts, cfg.concept_dim) * 0.02
         )
@@ -59,7 +49,6 @@ class ResonantVocab(nn.Module):
         self.register_buffer(
             "ema_sums", torch.zeros(cfg.n_concepts, cfg.concept_dim)
         )
-        # Mapa concepto -> top-K tokens BPE más frecuentes
         self.register_buffer(
             "concept_to_tokens",
             torch.full(
@@ -72,7 +61,6 @@ class ResonantVocab(nn.Module):
     def _init_weights(self):
         nn.init.normal_(self.tok_emb.weight, std=0.02)
         nn.init.normal_(self.projector.weight, std=0.02)
-        # Expander cercano a la inversa del projector para arrancar cerca de identidad
         with torch.no_grad():
             self.expander.weight.copy_(self.projector.weight.T)
 
@@ -93,11 +81,10 @@ class ResonantVocab(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """emb: [B,T,D] -> (quantized_emb [B,T,D], concept_ids [B,T], aux_loss)."""
         B, T, D = emb.shape
-        z = self.projector(emb.float())  # [B,T,C]
+        z = self.projector(emb.float())
         C = z.size(-1)
         z_flat = z.reshape(-1, C)
 
-        # Distancias en chunks (n_concepts grande → cdist O(B*T*K) memoria)
         n = z_flat.size(0)
         chunk = 4096
         idx = torch.empty(n, dtype=torch.long, device=z.device)
@@ -105,16 +92,14 @@ class ResonantVocab(nn.Module):
             d = torch.cdist(z_flat[i:i + chunk], self.codebook)
             idx[i:i + chunk] = d.argmin(dim=-1)
 
-        quantized_c = self.codebook[idx].reshape(B, T, C)  # [B,T,C]
+        quantized_c = self.codebook[idx].reshape(B, T, C)
 
-        # VQ losses (en espacio de concepto)
         commitment = F.mse_loss(z, quantized_c.detach())
         codebook_loss = F.mse_loss(quantized_c, z.detach())
         aux_loss = codebook_loss + self.cfg.commitment_beta * commitment
 
-        # Straight-through
         quantized_c_st = z + (quantized_c - z).detach()
-        quantized_emb = self.expander(quantized_c_st)  # [B,T,D]
+        quantized_emb = self.expander(quantized_c_st)
 
         return quantized_emb, idx.reshape(B, T), aux_loss
 
@@ -141,23 +126,49 @@ class ResonantVocab(nn.Module):
     def update_concept_to_tokens(
         self, ids: torch.Tensor, concept_ids: torch.Tensor
     ):
-        """Actualiza mapa concepto -> top-K tokens BPE (solo conceptos del batch)."""
+        """Actualiza mapa concepto -> top-K tokens. O(N log N) sin loops O(K·N).
+
+        Estrategia:
+          1. Ordenar (concepto, token) por concepto.
+          2. Iterar solo por los conceptos únicos (K << N típicamente),
+             procesando cada grupo sin boolean masking repetido.
+        """
         ids_flat = ids.reshape(-1).long()
         idx_flat = concept_ids.reshape(-1).long()
         K_top = self.cfg.concept_top_k_tokens
 
-        unique_concepts = torch.unique(idx_flat)
-        for k in unique_concepts.tolist():
-            mask = idx_flat == k
-            if not mask.any():
+        if ids_flat.numel() == 0:
+            return
+
+        # Ordenar por concepto (estable) para agrupar
+        order = idx_flat.argsort(stable=True)
+        sorted_concepts = idx_flat[order]
+        sorted_tokens = ids_flat[order]
+
+        # Fronteras de grupos
+        unique_concepts, counts = torch.unique_consecutive(
+            sorted_concepts, return_counts=True
+        )
+        ends = counts.cumsum(0).tolist()
+        starts = [0] + ends[:-1]
+
+        for k, start, end in zip(unique_concepts.tolist(), starts, ends):
+            toks = sorted_tokens[start:end]
+            if toks.numel() == 0:
                 continue
-            tokens, counts = torch.unique(ids_flat[mask], return_counts=True)
-            top = tokens[counts.argsort(descending=True)[:K_top]]
-            self.concept_to_tokens[k, :top.numel()] = top
+            tokens, tok_counts = torch.unique(toks, return_counts=True)
+            k_top = min(K_top, tokens.numel())
+            top_idx = tok_counts.argsort(descending=True)[:k_top]
+            self.concept_to_tokens[k, :k_top] = tokens[top_idx]
+            if k_top < K_top:
+                self.concept_to_tokens[k, k_top:] = -1
 
     @torch.no_grad()
     def reinit_dead_codes(self, min_count: float = 0.01) -> int:
-        """Reinicializa conceptos muertos con perturbaciones de conceptos vivos."""
+        """Reinicializa conceptos muertos con perturbaciones de vivos.
+
+        No determinista (usa randint/randn). Solo lo llama el analyzer.
+        """
         dead = (self.ema_counts < min_count).nonzero(as_tuple=True)[0]
         if dead.numel() == 0:
             return 0
@@ -165,7 +176,9 @@ class ResonantVocab(nn.Module):
         if live.numel() == 0:
             self.codebook[dead] = torch.randn_like(self.codebook[dead]) * 0.02
         else:
-            src = live[torch.randint(0, live.numel(), (dead.numel(),), device=live.device)]
+            src = live[
+                torch.randint(0, live.numel(), (dead.numel(),), device=live.device)
+            ]
             noise = torch.randn_like(self.codebook[dead]) * 0.01
             self.codebook[dead] = self.codebook[src] + noise
         self.ema_counts[dead] = 0.0
@@ -174,13 +187,11 @@ class ResonantVocab(nn.Module):
 
     # ---------------------------------------------------------------- API
     def embed(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids: [B,T] long -> emb: [B,T,D]."""
         return self.tok_emb(ids)
 
     def embed_and_quantize(
         self, ids: torch.Tensor, update: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """ids: [B,T] -> (quantized_emb [B,T,D], concept_ids [B,T], aux_loss)."""
         emb = self.embed(ids)
         quantized, concept_ids, aux_loss = self.quantize(emb)
         if update and not torch.is_grad_enabled():
@@ -196,10 +207,14 @@ class ResonantVocab(nn.Module):
         from tokenizers import Tokenizer
 
         tokenizer = Tokenizer.from_file(bpe_path)
+        actual_vocab = tokenizer.get_vocab_size()
+
         if cfg is None:
-            cfg = RVConfig(bpe_vocab_size=tokenizer.get_vocab_size())
-        else:
-            cfg.bpe_vocab_size = tokenizer.get_vocab_size()
+            cfg = RVConfig(bpe_vocab_size=actual_vocab)
+        elif cfg.bpe_vocab_size != actual_vocab:
+            # No mutar el cfg del caller
+            cfg = replace(cfg, bpe_vocab_size=actual_vocab)
+
         return cls(cfg, tokenizer)
 
     def state_for_checkpoint(self) -> dict:
