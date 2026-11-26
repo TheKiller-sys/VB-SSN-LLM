@@ -1,26 +1,34 @@
-FROM python:3.11-slim AS base
+FROM python:3.11-slim
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Dependencias de sistema mínimas
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl && \
-    rm -rf /var/lib/apt/lists/*
+# 1) Instalar PyTorch CPU-only (índice dedicado, ~200 MB en vez de ~2.5 GB)
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+        torch==2.3.1
 
+# 2) Resto de dependencias
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install -r requirements.txt
 
+# 3) Código
 COPY . .
 
-RUN mkdir -p data logs checkpoints && \
-    useradd -m -u 1000 app && chown -R app:app /app
-USER app
+# Usuario no-root (opcional pero recomendado)
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://localhost:8000/api/admin/health || exit 1
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
