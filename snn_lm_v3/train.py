@@ -33,9 +33,7 @@ def _lr_lambda(step: int, warmup: int, total: int, min_ratio: float = 0.0) -> fl
 
 
 def _codebook_stats(unwrapped) -> str:
-    """Devuelve string con uso de codebooks (RT + abstraction)."""
     parts = []
-    # RT
     rv = getattr(unwrapped, "rv", None)
     if rv is not None:
         try:
@@ -45,7 +43,6 @@ def _codebook_stats(unwrapped) -> str:
             parts.append(f"rt_cb={used}/{total}({pct:.1f}%)")
         except Exception:
             pass
-    # AbstractionHead
     abs_head = getattr(unwrapped, "abstraction_head", None)
     if abs_head is not None:
         try:
@@ -78,6 +75,8 @@ def evaluate(model, val_dl, device, max_batches: int = 50) -> dict:
             break
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        # En eval (model.eval()), update_memory=None -> self.training=False
+        # -> memoria/codebook no se actualizan. Correcto.
         _, loss = model(x, y)
         total_loss += loss.item()
         n += 1
@@ -117,9 +116,7 @@ def train(
     device = resolve_device(config.device)
     model = model.to(device)
 
-    if optimizer is None:
-        optimizer = _build_optimizer(model, config, optimizer_state)
-
+    # ── FIX v4.2: compile ANTES de construir el optimizer ──
     if config.compile and hasattr(torch, "compile"):
         try:
             model = torch.compile(model)
@@ -129,6 +126,9 @@ def train(
             if logger:
                 logger.warning(f"torch.compile falló: {e}")
 
+    if optimizer is None:
+        optimizer = _build_optimizer(model, config, optimizer_state)
+
     min_ratio = config.min_lr / config.lr if config.lr > 0 else 0.0
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -137,7 +137,9 @@ def train(
     if scheduler_state is not None:
         scheduler.load_state_dict(scheduler_state)
     elif start_step > 0:
-        scheduler.step(start_step)
+        # ── FIX v4.2: step() iterativo, compatible con cualquier versión ──
+        for _ in range(start_step):
+            scheduler.step()
 
     if config.use_amp and device.type == "cuda":
         scaler = torch.amp.GradScaler("cuda", enabled=True)
@@ -161,7 +163,6 @@ def train(
     if best_val_loss is None:
         best_val_loss = float("inf")
 
-    # ---- ContinuousAnalyzer ----
     analyzer: ContinuousAnalyzer | None = None
     unwrapped = _unwrap(model)
     if config.analyzer_enabled:
@@ -220,7 +221,6 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
-                # ── LOGGING con codebook + memoria ──
                 if config.log_every > 0 and step % config.log_every == 0 and logger:
                     lr = scheduler.get_last_lr()[0]
                     cb = _codebook_stats(_unwrap(model))
