@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 """CLI para entrenar BPE sobre un corpus de código.
 
+Sin cambios respecto a v4.2.1.
+
 Uso:
-    python scripts/train_bpe.py --corpus data/code/ --vocab-size 40000 --out checkpoints/bpe_code.json
+    python scripts/train_bpe.py --corpus data/code/ --vocab-size 40000 \\
+        --out checkpoints/bpe_code.json
 """
 from __future__ import annotations
 
