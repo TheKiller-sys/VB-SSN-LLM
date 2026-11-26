@@ -1,9 +1,8 @@
 """Verificador de consistencia entre texto y corpus / señales internas.
 
-Portado de VerifierCritic.js V1.5 con dos modos:
-  - verify(text, signals): verifica narrativa vs señales internas.
-  - verify_against_corpus(text, graph, observer): verifica texto vs reglas
-    minadas del corpus.
+FIX v4.2.1:
+  - `verify_against_corpus` cachea `_top_consequent_for` y `_find_rule` por
+    antecedente/consecuente para evitar O(T·k) por par en textos largos.
 """
 from __future__ import annotations
 
@@ -58,15 +57,6 @@ NARRATIVE_PATTERNS = {
 
 
 class ConsistencyVerifier:
-    """Verifica consistencia texto ↔ corpus / señales internas.
-
-    Uso:
-        verifier = ConsistencyVerifier()
-        problems = verifier.verify(text, signals)
-        problems += verifier.verify_against_corpus(text, graph, observer)
-        verdict = verifier.verdict(problems)
-    """
-
     def __init__(
         self,
         calm_threshold: float = 0.2,
@@ -83,8 +73,6 @@ class ConsistencyVerifier:
         self.severity_floor = severity_floor
         self.oov_ratio_threshold = oov_ratio_threshold
         self.repetition_threshold = repetition_threshold
-        # Umbral propio del verificador (más estricto que MIN_RULE_CONFIDENCE
-        # del grafo). Configurable para mantener intención explícita.
         self.rule_confidence_threshold = rule_confidence_threshold
         self.metrics = {"checks": 0, "problems": 0}
 
@@ -181,14 +169,17 @@ class ConsistencyVerifier:
     def verify_against_corpus(
         self, text: str, graph, observer
     ) -> list[Problem]:
-        """Verifica que el texto respete las transiciones minadas del corpus."""
+        """Verifica que el texto respete las transiciones minadas del corpus.
+
+        FIX v4.2.1: cachea `_top_consequent_for` y `_find_rule` por antecedente.
+        """
         problems: list[Problem] = []
 
         tokens = observer.tokenize(text)
         if len(tokens) < 2:
             return problems
 
-        # 1. Tokens fuera de vocabulario del corpus
+        # 1. OOV
         unknown = [t for t in tokens if t not in observer.vocabulary]
         if unknown:
             ratio = len(unknown) / len(tokens)
@@ -201,15 +192,30 @@ class ConsistencyVerifier:
                     note=f"{len(unknown)} tokens fuera de vocabulario del corpus",
                 ))
 
-        # 2. Contradicción con reglas del corpus
+        # Cache local de lookups
+        _consequent_cache: dict[str, str | None] = {}
+        _rule_cache: dict[tuple[str, str], object | None] = {}
+
+        def _cached_consequent(a: str) -> str | None:
+            if a not in _consequent_cache:
+                _consequent_cache[a] = self._top_consequent_for(a, graph)
+            return _consequent_cache[a]
+
+        def _cached_rule(a: str, c: str):
+            key = (a, c)
+            if key not in _rule_cache:
+                _rule_cache[key] = graph._find_rule(a, c)
+            return _rule_cache[key]
+
+        # 2. Contradicción con reglas
         for i in range(len(tokens) - 1):
             a, b = tokens[i], tokens[i + 1]
             if a == b:
                 continue
-            expected = self._top_consequent_for(a, graph)
+            expected = _cached_consequent(a)
             if expected and expected != b:
-                rule = graph._find_rule(a, expected)
-                if rule and rule.confidence >= self.rule_confidence_threshold:
+                rule = _cached_rule(a, expected)
+                if rule is not None and rule.confidence >= self.rule_confidence_threshold:
                     problems.append(Problem(
                         type="inconsistent_with_corpus",
                         severity=0.6,
@@ -220,7 +226,7 @@ class ConsistencyVerifier:
                         ),
                     ))
 
-        # 3. Degeneración: la misma transición repetida > umbral
+        # 3. Degeneración
         pair_counts: Counter = Counter()
         for i in range(len(tokens) - 1):
             pair_counts[(tokens[i], tokens[i + 1])] += 1
@@ -243,7 +249,6 @@ class ConsistencyVerifier:
         return problems
 
     def _top_consequent_for(self, antecedent: str, graph) -> str | None:
-        """Mejor consecuente para `antecedent` (vía `graph.lookup`)."""
         best = None
         best_conf = 0.0
         for r in graph.lookup(antecedent):
