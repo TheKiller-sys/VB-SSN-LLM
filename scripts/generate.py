@@ -35,6 +35,11 @@ def parse_args():
     p.add_argument("--verify", action="store_true")
     p.add_argument("--chunk-size", type=int, default=500)
 
+    # ── FIX v4.2: control explícito de memoria en generación ──
+    p.add_argument("--update-memory", action="store_true",
+                   help="Actualizar memoria episódica con la generación "
+                        "(continual learning). Default: False.")
+
     # RAG
     p.add_argument("--rag", action="store_true", help="Activar RAG")
     p.add_argument("--kb", default=None, help="Ruta al KnowledgeBase (.pt)")
@@ -98,7 +103,6 @@ def main():
     model, cfg, step = ckpt["model"], ckpt["config"], ckpt["step"]
     print(f"Checkpoint step={step}, params={model.num_params():,}, RT={ckpt['use_rt']}")
 
-    # LoRA: aplicar sobre el modelo cargado
     if args.lora:
         if not os.path.exists(args.lora):
             raise SystemExit(f"LoRA adapter not found: {args.lora}")
@@ -114,10 +118,8 @@ def main():
             print(f"LoRA fusionado en {n} módulos")
         model.eval()
 
-    # RAG
     rag_kb = build_rag_kb(args, model)
 
-    # Grafo
     graph, observer = build_or_load_graph(args)
     if graph is not None:
         print(f"Grafo: {graph.get_state()['rules_count']} reglas")
@@ -136,6 +138,7 @@ def main():
             top_k=args.top_k, top_p=args.top_p,
             seed=seed, device=device,
             use_cache=not args.no_cache,
+            update_memory=args.update_memory,  # ── FIX v4.2 ──
             rag_kb=rag_kb,
             rag_top_k=args.rag_k,
             rag_max_context_chars=args.rag_max_chars,
