@@ -50,8 +50,9 @@ class RTModelWrapper(nn.Module):
         update_memory: Optional[bool] = None,
         update_vocab: Optional[bool] = None,
     ):
+        # ── FIX v4.2: actualizar vocab en TRAIN, no en EVAL ──
         update_vocab_eff = (
-            update_vocab if update_vocab is not None else (not self.training)
+            update_vocab if update_vocab is not None else self.training
         )
         quantized_emb, _, aux_loss = self.rv.embed_and_quantize(
             ids, update=update_vocab_eff
@@ -86,7 +87,7 @@ class RTModelWrapper(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         use_cache: bool = True,
-        update_memory: bool = True,
+        update_memory: bool = False,  # ── FIX: default seguro ──
     ) -> torch.Tensor:
         self.eval()
         if max_new_tokens <= 0:
@@ -96,7 +97,14 @@ class RTModelWrapper(nn.Module):
         if idx.size(1) > seq_len:
             idx = idx[:, -seq_len:]
 
-        # Primer forward
+        # ── FIX v4.2: LIF temporal no es compatible con KV-cache ──
+        if (
+            use_cache
+            and self.config.use_spiking
+            and self.config.snn_mode == "temporal"
+        ):
+            use_cache = False
+
         if use_cache and idx.size(1) < seq_len:
             kv_caches = [None] * len(self.snnlm.blocks)
             logits, _, _ = self(
@@ -157,17 +165,19 @@ class RTModelWrapper(nn.Module):
     def load_memory_state_from_checkpoint(self, data: dict, device):
         if not data:
             return
-        rv_state = data.pop("resonant_vocab", None)
+        # ── FIX v4.2: no mutar el dict del caller ──
+        rv_state = data.get("resonant_vocab")
         if rv_state is not None:
             self.rv.load_state_from_checkpoint(rv_state, device)
         if hasattr(self.snnlm, "load_memory_state_from_checkpoint"):
             self.snnlm.load_memory_state_from_checkpoint(data, device)
 
     def __getattr__(self, name: str):
+        # ── FIX v4.2: guarda contra recursión durante __init__/deepcopy ──
+        modules = self.__dict__.get("_modules")
+        if not modules or "snnlm" not in modules:
+            raise AttributeError(name)
         try:
             return super().__getattr__(name)
         except AttributeError:
-            snnlm = self._modules.get("snnlm")
-            if snnlm is not None:
-                return getattr(snnlm, name)
-            raise
+            return getattr(modules["snnlm"], name)
