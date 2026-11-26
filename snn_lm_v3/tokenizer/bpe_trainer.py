@@ -1,23 +1,48 @@
-"""Entrena un BPE sobre un corpus de texto/código. Reversible, byte-level."""
+"""Entrena un BPE sobre un corpus de texto/código. Reversible, byte-level.
+
+FIX v4.2.1:
+  - Importa `CODE_EXTENSIONS` desde `dataset` (fuente única de verdad).
+  - Ignora `.git`, `node_modules`, `__pycache__`, etc.
+"""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterator
 
-CODE_EXTS = {
-    ".txt", ".py", ".js", ".ts", ".go", ".rs", ".c", ".h", ".cpp",
-    ".java", ".rb", ".md", ".kt", ".swift", ".scala", ".php", ".cs",
-}
+
+# Carpetas ignoradas en `rglob("*")`
+_IGNORE_DIR_PARTS = frozenset({
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    "dist", "build", ".tox", ".mypy_cache", ".pytest_cache",
+    ".ipynb_checkpoints", ".cache",
+})
+
+
+def _code_extensions() -> tuple[str, ...]:
+    """Importa `CODE_EXTENSIONS` del paquete padre, evitando ciclos."""
+    from ..dataset import CODE_EXTENSIONS
+    return tuple(CODE_EXTENSIONS)
+
+
+def _is_ignored_path(p: Path) -> bool:
+    return any(part in _IGNORE_DIR_PARTS for part in p.parts)
 
 
 def iter_corpus(paths: list[str], chunk_bytes: int = 10_000_000) -> Iterator[str]:
     """Itera chunks de texto desde archivos o directorios."""
+    exts = _code_extensions()
     for p in paths:
         path = Path(p)
-        files = list(path.rglob("*")) if path.is_dir() else [path]
+        if path.is_dir():
+            files = [
+                f for f in path.rglob("*")
+                if f.is_file()
+                and f.suffix.lower() in exts
+                and not _is_ignored_path(f)
+            ]
+        else:
+            files = [path] if path.is_file() else []
         for f in files:
-            if not f.is_file() or f.suffix.lower() not in CODE_EXTS:
-                continue
             try:
                 with open(f, "r", encoding="utf-8", errors="ignore") as fh:
                     while True:
