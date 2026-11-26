@@ -1,12 +1,9 @@
 """Tokenizer Resonante: BPE + codebook VQ acoplado.
 
 - `encode/decode`: BPE reversible.
-- `embed_and_quantize`: BPE embed → VQ → straight-through → expander.
-- `update_codebook`: EMA vectorizado (O(K) memoria, sin loops por nodo).
-- `update_concept_to_tokens`: top-K tokens por concepto (O(N log N), sin loops
-  O(K·N)).
-- `reinit_dead_codes`: no determinista (usa randint/randn); solo lo llama el
-  `ContinuousAnalyzer`, nunca el training loop.
+- `embed_and_quantize`: BPE embed -> VQ -> straight-through -> expander.
+- `update_codebook`: EMA vectorizado. Se puede llamar durante training
+  (usa `@torch.no_grad()` interno). FIX v4.2: ya no exige `not grad`.
 """
 from __future__ import annotations
 
@@ -79,7 +76,7 @@ class ResonantVocab(nn.Module):
     def quantize(
         self, emb: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """emb: [B,T,D] -> (quantized_emb [B,T,D], concept_ids [B,T], aux_loss)."""
+        """emb: [B,T,D] -> (quantized_emb, concept_ids, aux_loss)."""
         B, T, D = emb.shape
         z = self.projector(emb.float())
         C = z.size(-1)
@@ -94,9 +91,10 @@ class ResonantVocab(nn.Module):
 
         quantized_c = self.codebook[idx].reshape(B, T, C)
 
+        # Commitimiento del encoder. El codebook se actualiza vía EMA en
+        # `update_codebook`, no vía gradiente (evita doble actualización).
         commitment = F.mse_loss(z, quantized_c.detach())
-        codebook_loss = F.mse_loss(quantized_c, z.detach())
-        aux_loss = codebook_loss + self.cfg.commitment_beta * commitment
+        aux_loss = self.cfg.commitment_beta * commitment
 
         quantized_c_st = z + (quantized_c - z).detach()
         quantized_emb = self.expander(quantized_c_st)
@@ -105,7 +103,6 @@ class ResonantVocab(nn.Module):
 
     @torch.no_grad()
     def update_codebook(self, emb: torch.Tensor, concept_ids: torch.Tensor):
-        """EMA vectorizado. emb: [B,T,D], concept_ids: [B,T]."""
         z = self.projector(emb.float()).reshape(-1, self.cfg.concept_dim)
         idx = concept_ids.reshape(-1).long()
 
@@ -126,13 +123,6 @@ class ResonantVocab(nn.Module):
     def update_concept_to_tokens(
         self, ids: torch.Tensor, concept_ids: torch.Tensor
     ):
-        """Actualiza mapa concepto -> top-K tokens. O(N log N) sin loops O(K·N).
-
-        Estrategia:
-          1. Ordenar (concepto, token) por concepto.
-          2. Iterar solo por los conceptos únicos (K << N típicamente),
-             procesando cada grupo sin boolean masking repetido.
-        """
         ids_flat = ids.reshape(-1).long()
         idx_flat = concept_ids.reshape(-1).long()
         K_top = self.cfg.concept_top_k_tokens
@@ -140,12 +130,10 @@ class ResonantVocab(nn.Module):
         if ids_flat.numel() == 0:
             return
 
-        # Ordenar por concepto (estable) para agrupar
         order = idx_flat.argsort(stable=True)
         sorted_concepts = idx_flat[order]
         sorted_tokens = ids_flat[order]
 
-        # Fronteras de grupos
         unique_concepts, counts = torch.unique_consecutive(
             sorted_concepts, return_counts=True
         )
@@ -165,10 +153,6 @@ class ResonantVocab(nn.Module):
 
     @torch.no_grad()
     def reinit_dead_codes(self, min_count: float = 0.01) -> int:
-        """Reinicializa conceptos muertos con perturbaciones de vivos.
-
-        No determinista (usa randint/randn). Solo lo llama el analyzer.
-        """
         dead = (self.ema_counts < min_count).nonzero(as_tuple=True)[0]
         if dead.numel() == 0:
             return 0
@@ -194,12 +178,13 @@ class ResonantVocab(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         emb = self.embed(ids)
         quantized, concept_ids, aux_loss = self.quantize(emb)
-        if update and not torch.is_grad_enabled():
+        # ── FIX v4.2: ya NO se exige `not torch.is_grad_enabled()`.
+        # Los updates son @torch.no_grad() internamente y usan emb.detach(). ──
+        if update:
             self.update_codebook(emb.detach(), concept_ids)
             self.update_concept_to_tokens(ids.detach(), concept_ids)
         return quantized, concept_ids, aux_loss
 
-    # ---------------------------------------------------------------- load/save
     @classmethod
     def from_bpe(
         cls, bpe_path: str, cfg: Optional[RVConfig] = None
@@ -212,7 +197,6 @@ class ResonantVocab(nn.Module):
         if cfg is None:
             cfg = RVConfig(bpe_vocab_size=actual_vocab)
         elif cfg.bpe_vocab_size != actual_vocab:
-            # No mutar el cfg del caller
             cfg = replace(cfg, bpe_vocab_size=actual_vocab)
 
         return cls(cfg, tokenizer)
