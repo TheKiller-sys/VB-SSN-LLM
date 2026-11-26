@@ -1,9 +1,15 @@
-"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.1.
+"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.2.
 
 Thread safety:
   - `NeuralMemory` y `AbstractionHead` usan `threading.RLock` interno.
   - El `ContinuousAnalyzer` (hilo daemon) puede llamar `prune()` y
     `reinit_dead_codes()` de forma segura mientras el modelo entrene/gene.
+
+Semántica de `update` (FIX v4.2):
+  - `update=None` (default) -> `self.training`. La memoria se ACTUALIZA
+    durante el entrenamiento y NO se toca en eval/inference.
+  - `update=True` -> fuerza actualización (continual learning / generation).
+  - `update=False` -> solo retrieval, sin escritura.
 """
 from __future__ import annotations
 
@@ -23,7 +29,8 @@ class NeuralMemory(nn.Module):
     """Memoria episódica con kNN lookup y fast-weights Hebbian.
 
     - `forward(x)`: kNN lookup sobre `keys` y mezcla `values` en `x`.
-    - Si `update=True`: apila `x` en ring-buffer y aplica Hebb sobre `W_mem`.
+    - Si `update=True`: apila `x` en ring-buffer y aplica Heb sobre `W_mem`.
+    - `update=None` -> `self.training` (FIX v4.2).
     - `prune()`: elimina NaN/inf de keys/values (thread-safe).
     """
 
@@ -78,7 +85,6 @@ class NeuralMemory(nn.Module):
             "size", torch.zeros(1, dtype=torch.long), persistent=False,
         )
 
-        # Lock reentrante para proteger keys/values/ptr/size
         self._lock = threading.RLock()
 
     # ------------------------------------------------------- forward
@@ -87,8 +93,9 @@ class NeuralMemory(nn.Module):
         x: torch.Tensor,
         update: Optional[bool] = None,
     ) -> torch.Tensor:
+        # ── FIX v4.2: actualizar en TRAIN, no en EVAL ──
         if update is None:
-            update = not self.training
+            update = self.training
         if not self.use_fast_weights and not self.use_knn:
             return x
 
@@ -213,10 +220,7 @@ class NeuralMemory(nn.Module):
     # ------------------------------------------------------- prune
     @torch.no_grad()
     def prune(self) -> int:
-        """Elimina entradas con NaN/inf en keys/values. Thread-safe.
-
-        Devuelve el número de entradas eliminadas.
-        """
+        """Elimina entradas con NaN/inf en keys/values. Thread-safe."""
         with self._lock:
             n = int(self.size.item())
             if n == 0:
@@ -294,7 +298,11 @@ class NeuralMemory(nn.Module):
 # ABSTRACTION HEAD (VQ-VAE ligero con EMA)
 # ============================================================
 class AbstractionHead(nn.Module):
-    """Proyecta embeddings a un codebook discreto con EMA."""
+    """Proyecta embeddings a un codebook discreto con EMA.
+
+    `update=None` -> `self.training` (FIX v4.2). El codebook se actualiza
+    durante el entrenamiento y se congela en eval.
+    """
 
     def __init__(
         self,
@@ -333,8 +341,9 @@ class AbstractionHead(nn.Module):
         x: torch.Tensor,
         update: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ── FIX v4.2: actualizar en TRAIN, no en EVAL ──
         if update is None:
-            update = not self.training
+            update = self.training
 
         orig_dtype = x.dtype
         z = self.proj(x.float())
@@ -375,7 +384,6 @@ class AbstractionHead(nn.Module):
 
     @torch.no_grad()
     def reinit_dead_codes(self, min_count: float = 0.01) -> int:
-        """Reinicializa códigos muertos. Thread-safe."""
         with self._lock:
             dead = (self.ema_counts < min_count).nonzero(as_tuple=True)[0]
             n_dead = dead.shape[0]
