@@ -1,15 +1,12 @@
 """Añade documentos a un KnowledgeBase para RAG.
 
 Ejemplos:
-    # Crear KB nueva desde un corpus
     python scripts/add_knowledge.py --corpus data/noticias/ --out checkpoints/kb_news.pt \\
         --encoder hidden --ckpt checkpoints/best.pt
 
-    # Añadir más docs a un KB existente
     python scripts/add_knowledge.py --kb checkpoints/kb_news.pt \\
         --corpus data/articulos/ --encoder hidden --ckpt checkpoints/best.pt
 
-    # Usar sentence-transformers (mejor calidad, no atado al modelo)
     python scripts/add_knowledge.py --corpus data/ --out checkpoints/kb.pt \\
         --encoder sentence_transformer:all-MiniLM-L6-v2
 """
@@ -22,11 +19,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     SNNLM, KnowledgeBase, load_checkpoint, resolve_device,
     make_model_encoder, make_sentence_transformer_encoder,
 )
-from snn_lm_v3.dataset import load_texts_with_paths
+from snn_lm_v4.dataset import load_texts_with_paths
 
 
 def parse_args():
@@ -74,7 +71,6 @@ def build_encoder(args):
         name = args.encoder.split(":", 1)[1]
         print(f"Encoder: sentence-transformers {name}")
         enc = make_sentence_transformer_encoder(name)
-        # Inferir dim
         probe = enc("dimension probe")
         return enc, probe.shape[0]
     raise SystemExit(f"Unknown encoder: {args.encoder}")
