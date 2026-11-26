@@ -1,4 +1,9 @@
-"""RTModelWrapper: SNNLM + ResonantVocab. Encapsula el flujo completo."""
+"""RTModelWrapper: SNNLM + ResonantVocab. Encapsula el flujo completo.
+
+v4.3:
+  - `forward`/`generate` usan `state=` (unificado para attention y temporal).
+  - `generate` acepta `reasoning_bias` y lo aplica por token.
+"""
 from __future__ import annotations
 
 from typing import Optional
@@ -10,11 +15,7 @@ from .resonant_vocab import ResonantVocab
 
 
 class RTModelWrapper(nn.Module):
-    """SNNLM con embeddings cuantizados por el RT.
-
-    Sustituye el `tok_emb` del SNNLM por `rv.embed_and_quantize`.
-    Delega atributos al SNNLM (config, neural_memory, abstraction_head, etc.).
-    """
+    """SNNLM con embeddings cuantizados por el RT."""
 
     def __init__(
         self,
@@ -45,12 +46,11 @@ class RTModelWrapper(nn.Module):
         self,
         ids: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
-        kv_caches=None,
+        state=None,
         start_pos: int = 0,
         update_memory: Optional[bool] = None,
         update_vocab: Optional[bool] = None,
     ):
-        # ── FIX v4.2: actualizar vocab en TRAIN, no en EVAL ──
         update_vocab_eff = (
             update_vocab if update_vocab is not None else self.training
         )
@@ -61,17 +61,17 @@ class RTModelWrapper(nn.Module):
         out = self.snnlm(
             idx=ids,
             targets=targets,
-            kv_caches=kv_caches,
+            state=state,
             start_pos=start_pos,
             update_memory=update_memory,
             precomputed_embeddings=quantized_emb,
         )
 
         if targets is not None:
-            if kv_caches is not None:
-                logits, loss, new_kv = out
+            if state is not None:
+                logits, loss, new_state = out
                 loss = loss + self.aux_loss_weight * aux_loss
-                return logits, loss, new_kv
+                return logits, loss, new_state
             logits, loss = out
             loss = loss + self.aux_loss_weight * aux_loss
             return logits, loss
@@ -87,7 +87,8 @@ class RTModelWrapper(nn.Module):
         top_k: int | None = None,
         top_p: float | None = None,
         use_cache: bool = True,
-        update_memory: bool = False,  # ── FIX: default seguro ──
+        update_memory: bool = False,
+        reasoning_bias=None,
     ) -> torch.Tensor:
         self.eval()
         if max_new_tokens <= 0:
@@ -97,23 +98,34 @@ class RTModelWrapper(nn.Module):
         if idx.size(1) > seq_len:
             idx = idx[:, -seq_len:]
 
-        # ── FIX v4.2: LIF temporal no es compatible con KV-cache ──
-        if (
-            use_cache
-            and self.config.use_spiking
-            and self.config.snn_mode == "temporal"
-        ):
-            use_cache = False
+        n_blocks = len(self.snnlm.blocks)
+        core_type = getattr(self.config, "core_type", "attention")
+        use_state = core_type == "temporal"
+        use_kv = (
+            (not use_state)
+            and use_cache
+            and not (self.config.use_spiking and self.config.snn_mode == "temporal")
+        )
 
-        if use_cache and idx.size(1) < seq_len:
-            kv_caches = [None] * len(self.snnlm.blocks)
+        if use_state:
+            logits, states, _, _ = self.snnlm._forward(
+                idx,
+                state=[None] * n_blocks,
+                update_memory=update_memory,
+                precomputed_embeddings=self.rv.embed_and_quantize(
+                    idx, update=False,
+                )[0],
+            )
+            pos = idx.size(1)
+        elif use_kv and idx.size(1) < seq_len:
+            kv_caches = [None] * n_blocks
             logits, _, _ = self(
-                idx, kv_caches=kv_caches, start_pos=0,
+                idx, state=kv_caches, start_pos=0,
                 update_memory=update_memory,
             )
             pos = idx.size(1)
         else:
-            use_cache = False
+            use_kv = False
             kv_caches = None
             logits, _ = self(idx, update_memory=update_memory)
             pos = idx.size(1)
@@ -121,27 +133,45 @@ class RTModelWrapper(nn.Module):
         next_logits = logits[:, -1, :]
 
         for step in range(max_new_tokens):
+            biased = next_logits
+            if reasoning_bias is not None:
+                biased = next_logits.clone()
+                reasoning_bias.apply(biased, step=step)
+
             next_id = self.snnlm._sample_next(
-                next_logits, temperature, top_k, top_p
+                biased, temperature, top_k, top_p
             )
             idx = torch.cat([idx, next_id], dim=1)
+
+            if reasoning_bias is not None:
+                reasoning_bias.observe_token(int(next_id.item()))
+
             if step == max_new_tokens - 1:
                 break
 
-            if use_cache and pos + 1 <= seq_len:
+            if use_state:
                 next_emb, _, _ = self.rv.embed_and_quantize(next_id, update=False)
-                out = self.snnlm(
+                logits, _, states = self.snnlm(
                     idx=next_id,
-                    kv_caches=kv_caches,
+                    state=states,
+                    update_memory=update_memory,
+                    precomputed_embeddings=next_emb,
+                )
+                pos += 1
+                next_logits = logits[:, -1, :]
+            elif use_kv and pos + 1 <= seq_len:
+                next_emb, _, _ = self.rv.embed_and_quantize(next_id, update=False)
+                logits, _, kv_caches = self.snnlm(
+                    idx=next_id,
+                    state=kv_caches,
                     start_pos=pos,
                     update_memory=update_memory,
                     precomputed_embeddings=next_emb,
                 )
-                logits, _, kv_caches = out
                 pos += 1
                 next_logits = logits[:, -1, :]
             else:
-                use_cache = False
+                use_kv = False
                 idx_cond = idx[:, -seq_len:]
                 logits, _ = self(idx_cond, update_memory=update_memory)
                 next_logits = logits[:, -1, :]
@@ -165,7 +195,6 @@ class RTModelWrapper(nn.Module):
     def load_memory_state_from_checkpoint(self, data: dict, device):
         if not data:
             return
-        # ── FIX v4.2: no mutar el dict del caller ──
         rv_state = data.get("resonant_vocab")
         if rv_state is not None:
             self.rv.load_state_from_checkpoint(rv_state, device)
@@ -173,7 +202,6 @@ class RTModelWrapper(nn.Module):
             self.snnlm.load_memory_state_from_checkpoint(data, device)
 
     def __getattr__(self, name: str):
-        # ── FIX v4.2: guarda contra recursión durante __init__/deepcopy ──
         modules = self.__dict__.get("_modules")
         if not modules or "snnlm" not in modules:
             raise AttributeError(name)
