@@ -1,16 +1,14 @@
 """Componentes de SNN: neurona LIF + FFN con modos configurables.
 
+v4.3: añade `mode="hybrid"` (dense + spiking con gate aprendido).
+
 Modos del FFN:
+  * dense      -> FFN estándar GELU (sin LIF, sin spikes)
   * static     -> spike binario por token (sin membrana)
   * multi_step -> LIF con N pasos internos; salida BINARIA con STE
   * temporal   -> LIF a lo largo de la secuencia (BPTT, sin cache)
-  * gelu       -> FFN estándar GPT-2
-
-Salida:
-  Todos los modos devuelven spikes BINARIOS {0, 1}. Para multi_step se
-  acumula el conteo interno y se binariza con straight-through estimator
-  (forward binario, backward == gradiente del conteo) para que el
-  gradiente no muera en el umbral.
+  * hybrid     -> gate * gelu(fc1_dense) + (1-gate) * lif(fc1_spike)
+  * gelu       -> alias legacy de dense
 """
 from __future__ import annotations
 
@@ -43,19 +41,7 @@ def spike_fn(x: torch.Tensor, alpha: float = 2.0) -> torch.Tensor:
 
 # ---------------------------------------------------------------- LIF neuron
 class LIFNeuron(nn.Module):
-    """Leaky Integrate-and-Fire con salida binaria y STE.
-
-    Dinámica por paso:
-        v_t = decay * v_{t-1} + I_t
-        s_t = H(v_t - threshold)
-        v_t = v_t - s_t * threshold        (soft reset)
-        v_t = v_t * (1 - s_t)              (hard reset)
-
-    Salida:
-      - `forward(x, num_steps)`: spike BINARIO {0,1} (1 si disparó en
-        algún paso). STE para gradiente.
-      - `forward_temporal(x)`: spikes binarios por paso (BPTT).
-    """
+    """Leaky Integrate-and-Fire con salida binaria y STE."""
 
     def __init__(
         self,
@@ -98,9 +84,7 @@ class LIFNeuron(nn.Module):
     def _threshold(self) -> torch.Tensor:
         return self.threshold
 
-    # ----------- variante 1: pasos internos por posición (paralelo en T)
     def forward(self, x: torch.Tensor, num_steps: int = 1) -> torch.Tensor:
-        """x: (B, T, C). Devuelve spike BINARIO {0,1} por posición."""
         B, T, C = x.shape
         v = torch.zeros_like(x)
         fired_count = torch.zeros_like(x)
@@ -116,14 +100,10 @@ class LIFNeuron(nn.Module):
                 v = v * (1 - s)
             fired_count = fired_count + s
 
-        # ── FIX BINARIO: forward binario, backward == gradiente del conteo ──
         binary = (fired_count > 0).to(x.dtype)
         return fired_count + (binary - fired_count).detach()
 
-    # ----------- variante 2: la secuencia ES el tiempo (BPTT real)
     def forward_temporal(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, C). T se interpreta como tiempo. BPTT canónico.
-        Devuelve spikes binarios por paso: (B, T, C)."""
         B, T, C = x.shape
         v = torch.zeros(B, C, device=x.device, dtype=x.dtype)
         decay = self._decay().to(x.dtype)
@@ -144,9 +124,12 @@ class LIFNeuron(nn.Module):
 
 # ---------------------------------------------------------------- spiking FFN
 class SpikingFFN(nn.Module):
-    """FFN con activación SNN binaria configurable.
+    """FFN con activación configurable: dense, spiking, o hybrid.
 
-    `use_spiking=False` fuerza modo GELU. En otro caso se usa `mode`.
+    `ffn_mode`:
+      - "dense": fc1 -> GELU -> fc2 (GPT-2 style)
+      - "spiking" / "static" / "multi_step" / "temporal": FFN con LIF
+      - "hybrid": gate * dense + (1-gate) * spiking
     """
 
     def __init__(
@@ -165,31 +148,54 @@ class SpikingFFN(nn.Module):
         learnable_threshold: bool = False,
         learnable_decay: bool = False,
         track_stats: bool = False,
+        ffn_mode: str | None = None,
+        hybrid_gate_init: float = 0.5,
     ):
         super().__init__()
-        if mode not in ("static", "multi_step", "temporal", "gelu"):
-            raise ValueError(f"invalid mode: {mode!r}")
 
-        self.fc1 = nn.Linear(n_embd, n_embd * mult, bias=False)
-        self.fc2 = nn.Linear(n_embd * mult, n_embd, bias=False)
-        self.drop = nn.Dropout(dropout)
+        # Compatibilidad: si ffn_mode se pasa, gana sobre `mode`.
+        if ffn_mode is None:
+            if not use_spiking:
+                ffn_mode = "dense"
+            elif mode == "gelu":
+                ffn_mode = "dense"
+            else:
+                ffn_mode = "spiking"
+        if ffn_mode not in ("dense", "spiking", "hybrid"):
+            raise ValueError(f"invalid ffn_mode: {ffn_mode!r}")
+        if ffn_mode == "spiking" and mode not in (
+            "static", "multi_step", "temporal"
+        ):
+            raise ValueError(f"invalid spiking mode: {mode!r}")
 
-        self.use_spiking = use_spiking
-        self.mode = "gelu" if not use_spiking else mode
+        self.ffn_mode = ffn_mode
+        self.mode = mode
         self.residual = residual
         self.num_steps = int(num_steps)
         self.threshold = float(threshold)
         self.alpha = float(alpha)
         self.track_stats = bool(track_stats)
 
-        if self.mode in ("multi_step", "temporal"):
-            self.lif = LIFNeuron(
-                threshold=threshold,
-                decay=decay,
-                alpha=alpha,
-                reset_mode=reset_mode,
-                learnable_threshold=learnable_threshold,
-                learnable_decay=learnable_decay,
+        # Dense branches
+        self.fc1 = nn.Linear(n_embd, n_embd * mult, bias=False)
+        self.fc2 = nn.Linear(n_embd * mult, n_embd, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+        # Spiking branch (solo si aplica)
+        if ffn_mode == "spiking":
+            self._init_spiking_branch(n_embd, mult, decay, reset_mode,
+                                     learnable_threshold, learnable_decay)
+        elif ffn_mode == "hybrid":
+            self.fc1_spike = nn.Linear(n_embd, n_embd * mult, bias=False)
+            self._init_spiking_branch(n_embd, mult, decay, reset_mode,
+                                     learnable_threshold, learnable_decay,
+                                     lif_attr="_lif")
+            # gate aprendido: (n_embd,) -> (n_embd * mult,) logits de mezcla
+            # Usamos un escalar por canal para eficiencia.
+            gate_init = max(1e-4, min(1.0 - 1e-4, float(hybrid_gate_init)))
+            gate_logit = float(torch.logit(torch.tensor(gate_init)))
+            self.hybrid_gate_logit = nn.Parameter(
+                torch.full((n_embd * mult,), gate_logit)
             )
 
         if self.track_stats:
@@ -197,34 +203,70 @@ class SpikingFFN(nn.Module):
                 "last_firing_rate", torch.tensor(0.0), persistent=False
             )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.fc1(x)
+    def _init_spiking_branch(
+        self,
+        n_embd: int,
+        mult: int,
+        decay: float,
+        reset_mode: str,
+        learnable_threshold: bool,
+        learnable_decay: bool,
+        lif_attr: str = "lif",
+    ) -> None:
+        if self.mode in ("multi_step", "temporal"):
+            lif = LIFNeuron(
+                threshold=self.threshold,
+                decay=decay,
+                alpha=self.alpha,
+                reset_mode=reset_mode,
+                learnable_threshold=learnable_threshold,
+                learnable_decay=learnable_decay,
+            )
+            setattr(self, lif_attr, lif)
 
-        if self.mode == "gelu":
-            h = F.gelu(h)
+    def _dense_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.fc1(x))
 
-        elif self.mode == "static":
-            s = spike_fn(h - self.threshold, self.alpha)  # binario
-            if self.track_stats:
-                self.last_firing_rate.copy_(s.detach().mean())
-            h = s * h if self.residual else s
-
+    def _spiking_forward(self, h: torch.Tensor) -> torch.Tensor:
+        if self.mode == "static":
+            s = spike_fn(h - self.threshold, self.alpha)
         elif self.mode == "multi_step":
-            s = self.lif(h, self.num_steps)  # binario (STE)
-            if self.track_stats:
-                self.last_firing_rate.copy_(s.detach().mean())
-            h = s * h if self.residual else s
-
+            s = self.lif(h, self.num_steps)
         elif self.mode == "temporal":
-            s = self.lif.forward_temporal(h)  # binario por paso
-            if self.track_stats:
-                self.last_firing_rate.copy_(s.detach().mean())
-            h = s * h if self.residual else s
-
+            s = self.lif.forward_temporal(h)
         else:
-            raise RuntimeError(f"unreachable mode {self.mode}")
+            raise RuntimeError(f"unreachable spiking mode {self.mode}")
+
+        if self.track_stats:
+            self.last_firing_rate.copy_(s.detach().mean())
+        return s * h if self.residual else s
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.ffn_mode == "dense":
+            h = self._dense_forward(x)
+        elif self.ffn_mode == "spiking":
+            h = self._spiking_forward(self.fc1(x))
+        else:  # hybrid
+            h_dense = self._dense_forward(x)
+            h_spike = self._spiking_forward(self.fc1_spike(x))
+            gate = torch.sigmoid(self.hybrid_gate_logit)  # (mult*n_embd,)
+            h = gate.unsqueeze(0).unsqueeze(0) * h_dense + (
+                1.0 - gate
+            ).unsqueeze(0).unsqueeze(0) * h_spike
+            if self.track_stats:
+                # Reportar el gate medio como proxy de "cuánto SNN se usa"
+                self.last_firing_rate.copy_(
+                    (1.0 - gate.mean()).detach()
+                )
 
         return self.drop(self.fc2(h))
+
+    def extra_repr(self) -> str:
+        return (
+            f"mode={self.ffn_mode} (spiking={self.mode}), "
+            f"residual={self.residual}, "
+            f"mult={self.fc1.out_features // self.fc1.in_features}"
+        )
 
 
 # ---------------------------------------------------------------- alias legacy
