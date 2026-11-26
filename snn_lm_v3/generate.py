@@ -1,4 +1,9 @@
-"""Wrapper de generación: detecta RT, integra RAG opcional."""
+"""Wrapper de generación: detecta RT, integra RAG opcional.
+
+`update_memory` por defecto es `False` para evitar que la generación
+contamine la memoria episódica. Pasa `update_memory=True` explícitamente
+para continual learning.
+"""
 from __future__ import annotations
 
 import torch
@@ -37,12 +42,12 @@ def generate(
     enc_name: str | None = None,
     device=None,
     use_cache: bool = True,
-    update_memory: bool = True,
+    update_memory: bool = False,  # ── FIX v4.2: default seguro ──
     rag_kb=None,
     rag_top_k: int = 4,
     rag_max_context_chars: int = 2000,
 ) -> str:
-    """Genera texto. Si `rag_kb` se da, enriquece el prompt con contexto recuperado."""
+    """Genera texto. Si `rag_kb` se da, enriquece el prompt con contexto."""
     device = device or next(model.parameters()).device
     model.eval()
     if seed is not None:
