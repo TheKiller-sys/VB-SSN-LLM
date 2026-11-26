@@ -1,20 +1,14 @@
-"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.0.
+"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.1.
 
-Contiene cuatro componentes que se integran en `SNNLM`:
-
-  - `NeuralMemory`: kNN + fast weights con actualización Hebbian (sin backprop).
-  - `AbstractionHead`: VQ codebook con EMA (esquemas emergentes del latente).
-  - `SelfKnowledgeHead`: predice confianza del modelo por token (entrenado).
-  - `LatentReasoner`: cross-attention sobre `NeuralMemory` para razonamiento
-    latente (opcional, desactivado por defecto).
-
-Todas las actualizaciones "sin backprop" ocurren dentro de `torch.no_grad()`
-y NO tocan el grafo de cómputo del transformer. El transformer queda congelado
-durante generación/análisis; solo se actualizan buffers y fast-weights.
+Thread safety:
+  - `NeuralMemory` y `AbstractionHead` usan `threading.RLock` interno.
+  - El `ContinuousAnalyzer` (hilo daemon) puede llamar `prune()` y
+    `reinit_dead_codes()` de forma segura mientras el modelo entrene/gene.
 """
 from __future__ import annotations
 
 import math
+import threading
 from typing import Optional
 
 import torch
@@ -28,21 +22,9 @@ import torch.nn.functional as F
 class NeuralMemory(nn.Module):
     """Memoria episódica con kNN lookup y fast-weights Hebbian.
 
-    Comportamiento:
-      - `forward(x)` hace lookup kNN sobre `keys` y mezcla `values` en `x`.
-      - Si `update=True`, además apila `x` en el buffer (ring buffer FIFO)
-        y aplica regla de Hebb sobre `W_mem` (con decay y clamp de norma).
-
-    El buffer es circular (`ptr`), de tamaño fijo `max_size`.
-    Las claves/valores se guardan en `float32` siempre, para estabilidad.
-
-    IMPORTANTE:
-      - `W_mem` es un `nn.Linear(dim, dim, bias=False)` entrenable por backprop
-        durante el entrenamiento normal. El update Hebbian (eval) es
-        adicional y NO compite con el optimizador porque sólo se aplica
-        cuando `model.eval()`.
-      - Para evitar OOM con `max_size` grande, el lookup kNN se hace en
-        chunks de `append_batch_size`.
+    - `forward(x)`: kNN lookup sobre `keys` y mezcla `values` en `x`.
+    - Si `update=True`: apila `x` en ring-buffer y aplica Hebb sobre `W_mem`.
+    - `prune()`: elimina NaN/inf de keys/values (thread-safe).
     """
 
     def __init__(
@@ -75,14 +57,12 @@ class NeuralMemory(nn.Module):
         self.use_knn = use_knn
         self.append_batch_size = append_batch_size
 
-        # Fast weights (entrenable)
         if use_fast_weights:
             self.W_mem = nn.Linear(dim, dim, bias=False)
             nn.init.zeros_(self.W_mem.weight)
         else:
             self.W_mem = None
 
-        # Ring buffer (no persistente en checkpoint por tamaño, se guarda aparte)
         self.register_buffer(
             "keys", torch.zeros(max_size, dim, dtype=torch.float32),
             persistent=False,
@@ -98,13 +78,15 @@ class NeuralMemory(nn.Module):
             "size", torch.zeros(1, dtype=torch.long), persistent=False,
         )
 
+        # Lock reentrante para proteger keys/values/ptr/size
+        self._lock = threading.RLock()
+
     # ------------------------------------------------------- forward
     def forward(
         self,
         x: torch.Tensor,
         update: Optional[bool] = None,
     ) -> torch.Tensor:
-        """x: (B, T, D). Devuelve: (B, T, D) con memoria mezclada."""
         if update is None:
             update = not self.training
         if not self.use_fast_weights and not self.use_knn:
@@ -116,16 +98,13 @@ class NeuralMemory(nn.Module):
 
         out = x32
 
-        # 1. fast weights (backprop-friendly)
         if self.use_fast_weights and self.W_mem is not None:
             out = out + self.W_mem(x32)
 
-        # 2. kNN retrieval
         if self.use_knn and self.size.item() > 0:
             retrieved = self._knn_lookup(x32)
             out = out + retrieved
 
-        # 3. update (Hebbian + buffer append)
         if update:
             with torch.no_grad():
                 self._append(x32.detach())
@@ -136,145 +115,172 @@ class NeuralMemory(nn.Module):
 
     # ------------------------------------------------------- kNN
     def _knn_lookup(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, D) fp32. Devuelve: (B, T, D) fp32."""
-        B, T, D = x.shape
-        flat = x.reshape(-1, D)  # (B*T, D)
-        n_active = int(self.size.item())
+        with self._lock:
+            B, T, D = x.shape
+            flat = x.reshape(-1, D)
+            n_active = int(self.size.item())
 
-        if n_active == 0:
-            return torch.zeros_like(x)
+            if n_active == 0:
+                return torch.zeros_like(x)
 
-        if n_active == self.max_size:
-            active_keys = self.keys
-            active_values = self.values
-        else:
-            active_keys = self.keys[:n_active]
-            active_values = self.values[:n_active]
+            if n_active == self.max_size:
+                active_keys = self.keys
+                active_values = self.values
+            else:
+                active_keys = self.keys[:n_active]
+                active_values = self.values[:n_active]
 
-        k = min(self.k, n_active)
-        chunk = self.append_batch_size
+            k = min(self.k, n_active)
+            chunk = self.append_batch_size
 
-        results = []
-        for i in range(0, flat.shape[0], chunk):
-            q = flat[i:i + chunk]  # (c, D)
-            # similitud coseno (keys están normalizadas al apilar)
-            sims = q @ active_keys.T  # (c, N)
-            top_vals, top_idx = sims.topk(k, dim=-1)  # (c, k)
-            weights = torch.softmax(top_vals, dim=-1)  # (c, k)
-            neighbor_vals = active_values[top_idx]  # (c, k, D)
-            retrieved = (weights.unsqueeze(-1) * neighbor_vals).sum(dim=1)
-            results.append(retrieved)
+            results = []
+            for i in range(0, flat.shape[0], chunk):
+                q = flat[i:i + chunk]
+                sims = q @ active_keys.T
+                top_vals, top_idx = sims.topk(k, dim=-1)
+                weights = torch.softmax(top_vals, dim=-1)
+                neighbor_vals = active_values[top_idx]
+                retrieved = (weights.unsqueeze(-1) * neighbor_vals).sum(dim=1)
+                results.append(retrieved)
 
-        retrieved = torch.cat(results, dim=0)
-        return retrieved.reshape(B, T, D)
+            retrieved = torch.cat(results, dim=0)
+            return retrieved.reshape(B, T, D)
 
     # ------------------------------------------------------- append
     @torch.no_grad()
     def _append(self, x: torch.Tensor) -> None:
-        """x: (B, T, D) fp32. Apila al ring buffer con normalización L2."""
-        flat = x.reshape(-1, self.dim)
-        # Filtrar NaN/inf
-        valid = torch.isfinite(flat).all(dim=-1)
-        flat = flat[valid]
-        n = flat.shape[0]
-        if n == 0:
-            return
+        with self._lock:
+            flat = x.reshape(-1, self.dim)
+            valid = torch.isfinite(flat).all(dim=-1)
+            flat = flat[valid]
+            n = flat.shape[0]
+            if n == 0:
+                return
 
-        # Normalizar para similitud coseno
-        norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        flat = flat / norms
+            norms = flat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            flat = flat / norms
 
-        if n >= self.max_size:
-            # Sobrescribe todo con los últimos max_size
-            self.keys.copy_(flat[-self.max_size:])
-            self.values.copy_(flat[-self.max_size:])
-            self.ptr.fill_(0)
-            self.size.fill_(self.max_size)
-            return
+            if n >= self.max_size:
+                self.keys.copy_(flat[-self.max_size:])
+                self.values.copy_(flat[-self.max_size:])
+                self.ptr.fill_(0)
+                self.size.fill_(self.max_size)
+                return
 
-        ptr = int(self.ptr.item())
-        size = int(self.size.item())
-        end = ptr + n
+            ptr = int(self.ptr.item())
+            size = int(self.size.item())
+            end = ptr + n
 
-        if end <= self.max_size:
-            self.keys[ptr:end] = flat
-            self.values[ptr:end] = flat
-        else:
-            first = self.max_size - ptr
-            self.keys[ptr:] = flat[:first]
-            self.values[ptr:] = flat[:first]
-            rest = n - first
-            self.keys[:rest] = flat[first:]
-            self.values[:rest] = flat[first:]
+            if end <= self.max_size:
+                self.keys[ptr:end] = flat
+                self.values[ptr:end] = flat
+            else:
+                first = self.max_size - ptr
+                self.keys[ptr:] = flat[:first]
+                self.values[ptr:] = flat[:first]
+                rest = n - first
+                self.keys[:rest] = flat[first:]
+                self.values[:rest] = flat[first:]
 
-        self.ptr.fill_((ptr + n) % self.max_size)
-        self.size.fill_(min(self.max_size, size + n))
+            self.ptr.fill_((ptr + n) % self.max_size)
+            self.size.fill_(min(self.max_size, size + n))
 
     # ------------------------------------------------------- hebbian
     @torch.no_grad()
     def _hebbian_update(self, x: torch.Tensor, lr: float | None = None) -> None:
-        """Regla de Hebb con decay y clamp de norma.
+        with self._lock:
+            lr = self.hebbian_lr if lr is None else lr
+            if lr <= 0 or self.W_mem is None:
+                return
 
-        W = (1 - decay) * W + lr * (x^T @ x) / n
-        W = W * min(1, norm_clamp / ||W||)
+            flat = x.reshape(-1, self.dim)
+            valid = torch.isfinite(flat).all(dim=-1)
+            flat = flat[valid]
+            n = flat.shape[0]
+            if n < 2:
+                return
+
+            delta = (flat.T @ flat) / n
+
+            W = self.W_mem.weight.data
+            W.mul_(self.hebbian_decay)
+            W.add_(delta, alpha=lr)
+
+            norm = W.norm()
+            if norm > self.norm_clamp:
+                W.mul_(self.norm_clamp / norm)
+
+    # ------------------------------------------------------- prune
+    @torch.no_grad()
+    def prune(self) -> int:
+        """Elimina entradas con NaN/inf en keys/values. Thread-safe.
+
+        Devuelve el número de entradas eliminadas.
         """
-        lr = self.hebbian_lr if lr is None else lr
-        if lr <= 0 or self.W_mem is None:
-            return
+        with self._lock:
+            n = int(self.size.item())
+            if n == 0:
+                return 0
+            active_keys = self.keys if n == self.max_size else self.keys[:n]
+            active_values = self.values if n == self.max_size else self.values[:n]
 
-        flat = x.reshape(-1, self.dim)
-        valid = torch.isfinite(flat).all(dim=-1)
-        flat = flat[valid]
-        n = flat.shape[0]
-        if n < 2:
-            return
+            finite_mask = torch.isfinite(active_keys).all(dim=-1)
+            n_invalid = int((~finite_mask).sum().item())
+            if n_invalid == 0:
+                return 0
 
-        delta = (flat.T @ flat) / n  # (D, D)
+            keep_keys = active_keys[finite_mask]
+            keep_values = active_values[finite_mask]
+            n_keep = keep_keys.shape[0]
 
-        W = self.W_mem.weight.data
-        W.mul_(self.hebbian_decay)
-        W.add_(delta, alpha=lr)
+            self.keys[:n_keep] = keep_keys
+            self.values[:n_keep] = keep_values
+            if n_keep < self.max_size:
+                self.keys[n_keep:].zero_()
+                self.values[n_keep:].zero_()
 
-        norm = W.norm()
-        if norm > self.norm_clamp:
-            W.mul_(self.norm_clamp / norm)
+            self.size.fill_(n_keep)
+            self.ptr.fill_(0 if n_keep == self.max_size else n_keep)
+            return n_invalid
 
     # ------------------------------------------------------- api
     def get_keys(self) -> torch.Tensor:
-        """Devuelve las claves activas (para LatentReasoner)."""
-        n = int(self.size.item())
-        if n == 0:
-            return self.keys.new_zeros(0, self.dim)
-        if n == self.max_size:
-            return self.keys
-        return self.keys[:n]
+        with self._lock:
+            n = int(self.size.item())
+            if n == 0:
+                return self.keys.new_zeros(0, self.dim)
+            if n == self.max_size:
+                return self.keys.clone()
+            return self.keys[:n].clone()
 
     def reset(self) -> None:
-        self.keys.zero_()
-        self.values.zero_()
-        self.ptr.zero_()
-        self.size.zero_()
-        if self.W_mem is not None:
-            nn.init.zeros_(self.W_mem.weight)
+        with self._lock:
+            self.keys.zero_()
+            self.values.zero_()
+            self.ptr.zero_()
+            self.size.zero_()
+            if self.W_mem is not None:
+                nn.init.zeros_(self.W_mem.weight)
 
     def state_for_checkpoint(self) -> dict:
-        """Estado serializable (buffers incluidos)."""
-        return {
-            "keys": self.keys.cpu().clone(),
-            "values": self.values.cpu().clone(),
-            "ptr": self.ptr.cpu().clone(),
-            "size": self.size.cpu().clone(),
-        }
+        with self._lock:
+            return {
+                "keys": self.keys.cpu().clone(),
+                "values": self.values.cpu().clone(),
+                "ptr": self.ptr.cpu().clone(),
+                "size": self.size.cpu().clone(),
+            }
 
     def load_state_from_checkpoint(self, data: dict, device) -> None:
-        if "keys" in data:
-            self.keys.copy_(data["keys"].to(device))
-        if "values" in data:
-            self.values.copy_(data["values"].to(device))
-        if "ptr" in data:
-            self.ptr.copy_(data["ptr"].to(device))
-        if "size" in data:
-            self.size.copy_(data["size"].to(device))
+        with self._lock:
+            if "keys" in data:
+                self.keys.copy_(data["keys"].to(device))
+            if "values" in data:
+                self.values.copy_(data["values"].to(device))
+            if "ptr" in data:
+                self.ptr.copy_(data["ptr"].to(device))
+            if "size" in data:
+                self.size.copy_(data["size"].to(device))
 
     def extra_repr(self) -> str:
         return (
@@ -288,17 +294,7 @@ class NeuralMemory(nn.Module):
 # ABSTRACTION HEAD (VQ-VAE ligero con EMA)
 # ============================================================
 class AbstractionHead(nn.Module):
-    """Proyecta embeddings a un codebook discreto (esquemas emergentes).
-
-    El codebook NO se entrena por backprop: se actualiza con EMA durante
-    eval, de modo que los códigos convergen a los centroides de los
-    embeddings vistos. La proyección `proj` SÍ se entrena por backprop
-    con straight-through estimator.
-
-    Salida:
-      - `quantized`: (B, T, D) con straight-through
-      - `code_idx`: (B, T) índice discreto
-    """
+    """Proyecta embeddings a un codebook discreto con EMA."""
 
     def __init__(
         self,
@@ -320,7 +316,6 @@ class AbstractionHead(nn.Module):
 
         self.proj = nn.Linear(dim, dim)
 
-        # codebook como buffer (no entrenable)
         self.register_buffer(
             "codebook", torch.randn(n_codes, dim) * 0.02, persistent=True,
         )
@@ -331,26 +326,25 @@ class AbstractionHead(nn.Module):
             "ema_sums", torch.zeros(n_codes, dim), persistent=True,
         )
 
+        self._lock = threading.RLock()
+
     def forward(
         self,
         x: torch.Tensor,
         update: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """x: (B, T, D). Devuelve (quantized_st, code_idx)."""
         if update is None:
             update = not self.training
 
         orig_dtype = x.dtype
-        z = self.proj(x.float())  # (B, T, D)
+        z = self.proj(x.float())
         B, T, D = z.shape
 
-        # distancias
         z_flat = z.reshape(-1, D)
-        dists = torch.cdist(z_flat, self.codebook)  # (B*T, K)
-        idx = dists.argmin(dim=-1)  # (B*T,)
+        dists = torch.cdist(z_flat, self.codebook)
+        idx = dists.argmin(dim=-1)
         quantized = self.codebook[idx].reshape(B, T, D)
 
-        # straight-through
         quantized_st = z + (quantized - z).detach()
         code_idx = idx.reshape(B, T)
 
@@ -362,47 +356,45 @@ class AbstractionHead(nn.Module):
 
     @torch.no_grad()
     def _ema_update(self, z: torch.Tensor, idx: torch.Tensor) -> None:
-        """z: (N, D) fp32, idx: (N,) long."""
-        n = z.shape[0]
-        if n == 0:
-            return
+        with self._lock:
+            n = z.shape[0]
+            if n == 0:
+                return
+            one_hot = F.one_hot(idx, self.n_codes).float()
+            counts = one_hot.sum(dim=0)
+            sums = one_hot.T @ z
 
-        # Acumular por código
-        one_hot = F.one_hot(idx, self.n_codes).float()  # (N, K)
-        counts = one_hot.sum(dim=0)  # (K,)
-        sums = one_hot.T @ z  # (K, D)
+            decay = self.ema_decay
+            self.ema_counts.mul_(decay).add_(counts, alpha=1 - decay)
+            self.ema_sums.mul_(decay).add_(sums, alpha=1 - decay)
 
-        decay = self.ema_decay
-        self.ema_counts.mul_(decay).add_(counts, alpha=1 - decay)
-        self.ema_sums.mul_(decay).add_(sums, alpha=1 - decay)
-
-        # Actualizar sólo códigos con suficiente evidencia
-        n_eff = self.ema_counts.clamp(min=1e-6).unsqueeze(-1)
-        new_codes = self.ema_sums / n_eff
-        mask = (self.ema_counts > self.min_count_for_update).unsqueeze(-1)
-        self.codebook.copy_(torch.where(mask, new_codes, self.codebook))
+            n_eff = self.ema_counts.clamp(min=1e-6).unsqueeze(-1)
+            new_codes = self.ema_sums / n_eff
+            mask = (self.ema_counts > self.min_count_for_update).unsqueeze(-1)
+            self.codebook.copy_(torch.where(mask, new_codes, self.codebook))
 
     @torch.no_grad()
     def reinit_dead_codes(self, min_count: float = 0.01) -> int:
-        """Reinicializa códigos muertos con muestras recientes (si hay)."""
-        dead = (self.ema_counts < min_count).nonzero(as_tuple=True)[0]
-        n_dead = dead.shape[0]
-        if n_dead == 0:
-            return 0
-        # Reinicializar con perturbaciones de códigos vivos
-        live = (self.ema_counts >= min_count).nonzero(as_tuple=True)[0]
-        if live.shape[0] == 0:
-            self.codebook[dead] = torch.randn_like(self.codebook[dead]) * 0.02
-        else:
-            src = live[torch.randint(0, live.shape[0], (n_dead,), device=live.device)]
-            noise = torch.randn_like(self.codebook[dead]) * 0.01
-            self.codebook[dead] = self.codebook[src] + noise
-        self.ema_counts[dead] = 0.0
-        self.ema_sums[dead] = 0.0
-        return int(n_dead)
+        """Reinicializa códigos muertos. Thread-safe."""
+        with self._lock:
+            dead = (self.ema_counts < min_count).nonzero(as_tuple=True)[0]
+            n_dead = dead.shape[0]
+            if n_dead == 0:
+                return 0
+            live = (self.ema_counts >= min_count).nonzero(as_tuple=True)[0]
+            if live.shape[0] == 0:
+                self.codebook[dead] = torch.randn_like(self.codebook[dead]) * 0.02
+            else:
+                src = live[
+                    torch.randint(0, live.shape[0], (n_dead,), device=live.device)
+                ]
+                noise = torch.randn_like(self.codebook[dead]) * 0.01
+                self.codebook[dead] = self.codebook[src] + noise
+            self.ema_counts[dead] = 0.0
+            self.ema_sums[dead] = 0.0
+            return int(n_dead)
 
     def get_code_for(self, emb: torch.Tensor) -> torch.Tensor:
-        """emb: (..., D). Devuelve code_idx (...)."""
         orig_shape = emb.shape[:-1]
         z = self.proj(emb.float())
         flat = z.reshape(-1, self.dim)
@@ -411,23 +403,17 @@ class AbstractionHead(nn.Module):
         return idx.reshape(orig_shape)
 
     def reset(self) -> None:
-        nn.init.normal_(self.codebook, std=0.02)
-        self.ema_counts.zero_()
-        self.ema_sums.zero_()
+        with self._lock:
+            nn.init.normal_(self.codebook, std=0.02)
+            self.ema_counts.zero_()
+            self.ema_sums.zero_()
 
 
 # ============================================================
 # SELF-KNOWLEDGE HEAD
 # ============================================================
 class SelfKnowledgeHead(nn.Module):
-    """Predice la confianza del modelo por token (entrenable).
-
-    Entrada: hidden state (B, T, D) + concepto (tok_emb, B, T, D).
-    Salida: confidence (B, T) en [0, 1].
-
-    Auto-supervisión: confidence_target = (argmax logits == target).
-    Se entrena con BCE.
-    """
+    """Predice la confianza del modelo por token."""
 
     def __init__(self, dim: int, hidden: int | None = None):
         super().__init__()
@@ -452,7 +438,6 @@ class SelfKnowledgeHead(nn.Module):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        """BCE entre confidence y acierto del modelo."""
         with torch.no_grad():
             correct = (logits.argmax(dim=-1) == targets).float()
         return F.binary_cross_entropy(
@@ -465,10 +450,7 @@ class SelfKnowledgeHead(nn.Module):
 # LATENT REASONER
 # ============================================================
 class LatentReasoner(nn.Module):
-    """Cross-attention sobre claves de memoria (razonamiento latente).
-
-    Opcional. Añade latencia. Desactivado por defecto.
-    """
+    """Cross-attention sobre claves de memoria."""
 
     def __init__(self, dim: int, n_heads: int = 4, n_layers: int = 2):
         super().__init__()
@@ -497,7 +479,6 @@ class LatentReasoner(nn.Module):
         if mem_keys is None or mem_keys.shape[0] == 0:
             return x
 
-        # mem: (B, N, D) — expandir batch
         B = x.shape[0]
         mem = mem_keys.unsqueeze(0).expand(B, -1, -1)
         for layer in self.layers:
