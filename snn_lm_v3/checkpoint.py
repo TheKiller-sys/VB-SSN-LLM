@@ -7,7 +7,19 @@ import os
 import numpy as np
 import torch
 
-CKPT_VERSION = 5  # bumped: LoRA-aware
+CKPT_VERSION = 5  # bumped: LoRA-aware + memory-aware
+
+
+# Buffers persistent=False que NO aparecen en state_dict y por tanto pueden
+# aparecer como "missing" en PyTorch antiguos. Filtro explícito (no substrings).
+_IGNORE_MISSING_EXACT = {
+    "rope_cos", "rope_sin",
+    "last_firing_rate",
+}
+_IGNORE_MISSING_SUFFIXES = (
+    ".keys", ".values", ".ptr", ".size",       # NeuralMemory buffers
+    ".last_firing_rate",                       # track_stats buffers
+)
 
 
 def _unwrap(model):
@@ -31,6 +43,12 @@ def _has_lora_keys(state_dict: dict) -> bool:
     return any(".lora_A" in k or ".lora_B" in k for k in state_dict.keys())
 
 
+def _is_ignorable_missing(key: str) -> bool:
+    if key in _IGNORE_MISSING_EXACT:
+        return True
+    return any(key.endswith(s) for s in _IGNORE_MISSING_SUFFIXES)
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -49,7 +67,6 @@ def save_checkpoint(
 
     is_rt = _is_rt(unwrapped)
 
-    # Detectar LoRA activo
     from .lora import is_lora_active, lora_state_dict
     lora_active = is_lora_active(unwrapped)
     lora_state = lora_state_dict(unwrapped) if lora_active else None
@@ -99,7 +116,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     raw = ckpt["config"]
     cfg = GPTConfig(**{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__})
 
-    # Validar vocab
     ckpt_vocab = raw.get("vocab_size")
     if ckpt_vocab is not None:
         model_vocab = ckpt["model"]["tok_emb.weight"].shape[0]
@@ -114,7 +130,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     has_rt_state = _has_rt_keys(state_dict)
     has_lora_state = _has_lora_keys(state_dict)
 
-    # ── Validaciones estrictas ──
     if use_rt and not has_rt_state:
         raise ValueError(
             "Checkpoint says use_rt=True but has no 'rv.*' keys in state_dict."
@@ -136,7 +151,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
             "Checkpoint has LoRA keys but use_lora=False in payload."
         )
 
-    # ── Construir el modelo ──
     if use_rt:
         from .tokenizer import ResonantVocab, RVConfig, RTModelWrapper
         rv_data = ckpt.get("rt_config") or {}
@@ -152,7 +166,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     else:
         model = model_class(cfg)
 
-    # ── Aplicar LoRA ANTES de load_state_dict si el ckpt lo tenía ──
     if use_lora:
         from .lora import apply_lora, load_lora_state_dict
         lora_cfg = ckpt.get("lora_config") or {}
@@ -167,22 +180,13 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if unexpected:
         raise ValueError(f"Unexpected keys in checkpoint: {unexpected[:10]}")
-    # `missing` puede contener buffers persistent=False legítimos.
-    # Filtramos esos (no aparecen en state_dict porque persistent=False).
-    # Si hay missing de parámetros reales, es un problema.
-    real_missing = [
-        k for k in missing
-        if "keys" not in k and "values" not in k
-        and "ptr" not in k and "size" not in k
-        and "rope_cos" not in k and "rope_sin" not in k
-        and "last_firing_rate" not in k
-    ]
+
+    # ── FIX v4.2: filtro robusto (sin substrings frágiles) ──
+    real_missing = [k for k in missing if not _is_ignorable_missing(k)]
     if real_missing:
         raise ValueError(f"Missing parameters in checkpoint: {real_missing[:10]}")
 
     if use_lora and ckpt.get("lora_state"):
-        # Redundancia: recargar LoRA state explícitamente (ya debería estar
-        # tras load_state_dict, pero esto garantiza consistencia).
         from .lora import load_lora_state_dict
         load_lora_state_dict(model, ckpt["lora_state"])
 
