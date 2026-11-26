@@ -1,0 +1,13 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./state.db:/app/state.db
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    restart: always
+    shm_size: "16gb"
