@@ -1,11 +1,7 @@
 """Grafo de razonamiento simbólico sobre corpus.
 
-Portado de SymbolicAbstractionLayer.js v2.1:
-  - anti-ciclo (_would_create_cycle)
-  - cooldown por regla (adaptado: cooldown en pasos, no en ms)
-  - tautología + overlap filtering
-  - pruning por confianza × uso × recencia
-  - decay de reglas no usadas
+FIX v4.2.1:
+  - `_ensure_symbol` acumula el conteo en vez de sobreescribirlo.
 """
 from __future__ import annotations
 
@@ -113,15 +109,6 @@ class Rule:
 
 
 class ReasoningGraph:
-    """Motor de reglas con anti-ciclo, cooldown y pruning.
-
-    Uso:
-        graph = ReasoningGraph()
-        n = graph.mine_from_corpus(observer)
-        graph.tick()
-        consequences = graph.apply(facts)
-    """
-
     def __init__(self, cooldown_steps: int = DEFAULT_COOLDOWN_STEPS):
         self.rules: dict[str, Rule] = {}
         self.by_antecedent: dict[str, list[str]] = {}
@@ -142,7 +129,6 @@ class ReasoningGraph:
 
     # ------------------------------------------------------------- reloj
     def tick(self, n: int = 1) -> None:
-        """Avanza el reloj interno del grafo (para cooldown)."""
         if n < 0:
             raise ValueError("tick n must be >= 0")
         self._step += int(n)
@@ -150,9 +136,6 @@ class ReasoningGraph:
     # ------------------------------------------------------------- utilidades
     @staticmethod
     def _rule_key(a: str) -> str:
-        """Clave canónica: strings multipalabra se ordenan e ignoran mayúsculas
-        para que "hello world" y "world hello" mapeen al mismo bucket.
-        Tuplas/sets conservan el comportamiento original."""
         if isinstance(a, str):
             return " ".join(sorted(a.lower().split()))
         return "+".join(sorted(a))
@@ -161,7 +144,6 @@ class ReasoningGraph:
         return str(a).lower() == str(b).lower()
 
     def lookup(self, antecedent: str) -> list[Rule]:
-        """Devuelve las reglas cuyo antecedente coincide (vía `_rule_key`)."""
         key = self._rule_key(antecedent)
         out: list[Rule] = []
         for rid in self.by_antecedent.get(key, []):
@@ -191,8 +173,6 @@ class ReasoningGraph:
     def create_rule(
         self, antecedent: str, consequent: str, evidence: dict | None = None
     ) -> Rule | None:
-        """Crea una regla. NO avanza el reloj: el cooldown sólo debe consumirse
-        con `tick()` o con `apply()`."""
         if self._is_tautology(antecedent, consequent):
             self.metrics["tautological_rejected"] += 1
             return None
@@ -204,8 +184,6 @@ class ReasoningGraph:
             return None
 
         if len(self.rules) >= MAX_RULES:
-            # Al alcanzar el tope hay que forzar prune, porque el trigger
-            # normal (1.2 × MAX_RULES) es inalcanzable cuando MAX_RULES es cap.
             self.prune(force=True)
             if len(self.rules) >= MAX_RULES:
                 return None
@@ -214,7 +192,6 @@ class ReasoningGraph:
         rule = Rule(id=rid, antecedent=antecedent, consequent=consequent)
         if evidence:
             rule.reinforce(evidence)
-        # Asegurar que pasa el umbral tras un refuerzo inicial
         if rule.confidence < MIN_RULE_CONFIDENCE:
             if evidence:
                 rule.reinforce(evidence)
@@ -228,7 +205,6 @@ class ReasoningGraph:
 
     # ------------------------------------------------------------- aplicación
     def apply(self, facts: Iterable[str]) -> list[dict]:
-        """Aplica reglas que matchean, respetando cooldown por paso."""
         facts = list(facts)
         consequences: list[dict] = []
         seen: set[str] = set()
@@ -260,7 +236,6 @@ class ReasoningGraph:
 
     # ------------------------------------------------------------- mining
     def mine_from_corpus(self, observer) -> int:
-        """Mina reglas desde un CorpusObserver."""
         new_rules = 0
 
         for token, count in observer.candidate_symbols():
@@ -277,11 +252,6 @@ class ReasoningGraph:
         return new_rules
 
     def mine_from_log(self, log: list[dict]) -> int:
-        """Mina reglas desde un log de observaciones.
-
-        Cada entrada: {at, facts: list[str]}. Pares consecutivos con delay
-        razonable refuerzan o crean reglas.
-        """
         if len(log) < 6:
             return 0
 
@@ -306,7 +276,8 @@ class ReasoningGraph:
         return new_rules
 
     def _ensure_symbol(self, token: str, count: int) -> None:
-        self._symbols[token] = count
+        # FIX v4.2.1: acumular en vez de sobreescribir
+        self._symbols[token] = self._symbols.get(token, 0) + count
 
     # ------------------------------------------------------------- pruning
     def prune(self, force: bool = False) -> int:
@@ -315,8 +286,6 @@ class ReasoningGraph:
             return 0
 
         keep_n = int(MAX_RULES * RULE_PRUNE_KEEP_RATIO)
-        # Si se fuerza el prune en un grafo más pequeño que keep_n, reducir
-        # el objetivo a una fracción del tamaño actual para que pode de verdad.
         if force and len(self.rules) <= keep_n:
             keep_n = max(1, int(len(self.rules) * RULE_PRUNE_KEEP_RATIO))
 
