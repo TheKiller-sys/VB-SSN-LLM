@@ -1,6 +1,6 @@
-"""SNN-LM v4.2 — Transformer causal con FFN de spikes, memoria neural,
-abstracción geométrica, autoconocimiento, razonamiento simbólico,
-Resonant Tokenizer (BPE + VQ), RAG y LoRA."""
+"""SNN-LM v4.3 — Transformer con core configurable (attention|temporal SSM),
+FFN híbrido dense+spiking, memoria neural, abstracción geométrica,
+autoconocimiento, razonamiento simbólico con bias en logits, RT y LoRA."""
 from .config import (
     GPTConfig, resolve_device,
     SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE, SIZES,
@@ -11,6 +11,7 @@ from .snn import (
 )
 from .rope import precompute_rope, apply_rope, rotate_half
 from .attention import MultiHeadAttention
+from .temporal_core import TemporalCore
 from .block import TransformerBlock
 from .model import SNNLM
 from .memory import (
@@ -54,7 +55,11 @@ from .reasoning import (
     save_graph, load_graph,
 )
 
-__version__ = "4.2.0"
+# Reasoning bias (v4.3)
+from .symbol_mapping import TokenSymbolMapper
+from .reasoning_bias import ReasoningBias, ReasoningBiasState
+
+__version__ = "4.3.0"
 
 __all__ = [
     # config
@@ -66,7 +71,7 @@ __all__ = [
     # rope
     "precompute_rope", "apply_rope", "rotate_half",
     # transformer
-    "MultiHeadAttention", "TransformerBlock", "SNNLM",
+    "MultiHeadAttention", "TemporalCore", "TransformerBlock", "SNNLM",
     # memory
     "NeuralMemory", "AbstractionHead", "SelfKnowledgeHead", "LatentReasoner",
     # data
@@ -93,4 +98,6 @@ __all__ = [
     "ReasoningGraph", "Rule",
     "ConsistencyVerifier", "Verdict", "Problem",
     "save_graph", "load_graph",
+    # reasoning bias (v4.3)
+    "TokenSymbolMapper", "ReasoningBias", "ReasoningBiasState",
 ]
