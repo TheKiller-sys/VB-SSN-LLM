@@ -1,4 +1,11 @@
-"""Genera texto desde un checkpoint, con RAG y/o LoRA opcionales."""
+"""Genera texto desde un checkpoint, con RAG y/o LoRA opcionales.
+
+FIX v4.2.1:
+  - SignalProbe soporta RTModelWrapper (vía `signals.py`).
+  - Nota: el orden `load_lora` → `merge_lora` es intencional. Si el usuario
+    pasa `--lora` + `--merge-lora` sobre un checkpoint que ya tenía LoRA,
+    el adapter nuevo se mergea sobre los pesos base del ckpt.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,14 +15,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     SNNLM, generate, resolve_device, load_texts,
     CorpusObserver, ReasoningGraph, ConsistencyVerifier,
     SignalProbe, load_graph,
     KnowledgeBase, make_model_encoder, make_sentence_transformer_encoder,
     apply_lora, load_lora, merge_lora, is_lora_active,
 )
-from snn_lm_v3.checkpoint import load_checkpoint
+from snn_lm_v4.checkpoint import load_checkpoint
 
 
 def parse_args():
@@ -35,7 +42,6 @@ def parse_args():
     p.add_argument("--verify", action="store_true")
     p.add_argument("--chunk-size", type=int, default=500)
 
-    # ── FIX v4.2: control explícito de memoria en generación ──
     p.add_argument("--update-memory", action="store_true",
                    help="Actualizar memoria episódica con la generación "
                         "(continual learning). Default: False.")
@@ -127,7 +133,11 @@ def main():
     verifier = ConsistencyVerifier() if args.verify else None
     probe = None
     if args.verify and cfg.snn_track_stats:
-        probe = SignalProbe(model, device)
+        try:
+            probe = SignalProbe(model, device)
+        except Exception as e:
+            print(f"[verify] SignalProbe no disponible: {e}")
+            probe = None
 
     for i in range(args.samples):
         seed = None if args.seed is None else args.seed + i
@@ -138,7 +148,7 @@ def main():
             top_k=args.top_k, top_p=args.top_p,
             seed=seed, device=device,
             use_cache=not args.no_cache,
-            update_memory=args.update_memory,  # ── FIX v4.2 ──
+            update_memory=args.update_memory,
             rag_kb=rag_kb,
             rag_top_k=args.rag_k,
             rag_max_context_chars=args.rag_max_chars,
