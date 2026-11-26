@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>SNN-LM Dashboard</title>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 font-mono p-6">
+
+<header class="flex justify-between items-center mb-6">
+  <h1 class="text-2xl font-bold">SNN-LM</h1>
+  <div id="model-info" class="text-sm text-slate-400"
+       hx-get="/api/model/info" hx-trigger="load, every 5s">
+    Cargando...
+  </div>
+</header>
+
+<nav class="flex gap-2 mb-6">
+  <button class="px-3 py-1 rounded bg-slate-700"
+          hx-get="/api/model/info" hx-target="#panel">Model</button>
+  <button class="px-3 py-1 rounded bg-slate-700"
+          hx-get="/api/train/list" hx-target="#panel">Jobs</button>
+  <button class="px-3 py-1 rounded bg-slate-700"
+          hx-get="/api/files/list" hx-target="#panel">Files</button>
+</nav>
+
+<div class="grid grid-cols-2 gap-6">
+  <section class="bg-slate-800 p-4 rounded">
+    <h2 class="font-bold mb-2">Chat</h2>
+    <form hx-post="/api/chat/" hx-target="#chat-output"
+          hx-ext="json-enc" class="space-y-2">
+      <textarea name="prompt" rows="3"
+        class="w-full bg-slate-900 p-2 rounded"
+        placeholder="Prompt..."></textarea>
+      <input name="max_tokens" type="number" value="200"
+        class="w-24 bg-slate-900 p-1 rounded">
+      <button class="bg-blue-600 px-4 py-1 rounded">Generar</button>
+    </form>
+    <pre id="chat-output"
+         class="mt-4 bg-slate-900 p-3 rounded whitespace-pre-wrap min-h-[8rem]"></pre>
+  </section>
+
+  <section id="panel" class="bg-slate-800 p-4 rounded">
+    <h2 class="font-bold mb-2">Panel</h2>
+    <p class="text-slate-500">Selecciona una tab</p>
+  </section>
+</div>
+
+</body>
+</html>
