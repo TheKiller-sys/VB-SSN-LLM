@@ -1,9 +1,8 @@
 """Tokenizer Resonante: BPE + codebook VQ acoplado.
 
-- `encode/decode`: BPE reversible.
-- `embed_and_quantize`: BPE embed -> VQ -> straight-through -> expander.
-- `update_codebook`: EMA vectorizado. Se puede llamar durante training
-  (usa `@torch.no_grad()` interno). FIX v4.2: ya no exige `not grad`.
+FIX v4.2.1:
+  - `torch.unique(..., sorted=True)` en `update_concept_to_tokens` (orden
+    determinista entre runs).
 """
 from __future__ import annotations
 
@@ -28,7 +27,7 @@ class RVConfig:
 
 
 class ResonantVocab(nn.Module):
-    """Tokenizer BPE + codebook VQ. Ver docstring del módulo."""
+    """Tokenizer BPE + codebook VQ."""
 
     def __init__(self, cfg: RVConfig, bpe_tokenizer):
         super().__init__()
@@ -91,8 +90,6 @@ class ResonantVocab(nn.Module):
 
         quantized_c = self.codebook[idx].reshape(B, T, C)
 
-        # Commitimiento del encoder. El codebook se actualiza vía EMA en
-        # `update_codebook`, no vía gradiente (evita doble actualización).
         commitment = F.mse_loss(z, quantized_c.detach())
         aux_loss = self.cfg.commitment_beta * commitment
 
@@ -144,7 +141,8 @@ class ResonantVocab(nn.Module):
             toks = sorted_tokens[start:end]
             if toks.numel() == 0:
                 continue
-            tokens, tok_counts = torch.unique(toks, return_counts=True)
+            # FIX v4.2.1: sorted=True para determinismo entre runs
+            tokens, tok_counts = torch.unique(toks, return_counts=True, sorted=True)
             k_top = min(K_top, tokens.numel())
             top_idx = tok_counts.argsort(descending=True)[:k_top]
             self.concept_to_tokens[k, :k_top] = tokens[top_idx]
@@ -178,8 +176,6 @@ class ResonantVocab(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         emb = self.embed(ids)
         quantized, concept_ids, aux_loss = self.quantize(emb)
-        # ── FIX v4.2: ya NO se exige `not torch.is_grad_enabled()`.
-        # Los updates son @torch.no_grad() internamente y usan emb.detach(). ──
         if update:
             self.update_codebook(emb.detach(), concept_ids)
             self.update_concept_to_tokens(ids.detach(), concept_ids)
