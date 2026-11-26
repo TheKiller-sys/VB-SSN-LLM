@@ -1,15 +1,9 @@
 """Observador del corpus: convierte texto en observaciones estructuradas.
 
-Es el equivalente de `_stateLog` + `_observeStateSequence` + `_mineFromStateLog`
-de SymbolicAbstractionLayer.js, pero la entrada es texto del corpus, no
-estados bioquímicos.
-
-Mantiene:
-  - observations: ventanas de texto procesadas
-  - vocabulary: frecuencia de tokens significativos
-  - transitions: contadores de pares (A→B) con delay en caracteres
-  - sequences: ventanas deslizantes de tokens
-  - state_log: registro plano para mining tipo SAL
+FIX v4.2.1:
+  - `_record_transitions` no llama `_min_delay` para pares que no se van a
+    registrar (ya sea porque el par ya existe o porque el grafo está al tope).
+    Esto reduce coste O(n²) por chunk en corpus grandes.
 """
 from __future__ import annotations
 
@@ -21,7 +15,6 @@ from dataclasses import dataclass, field
 import tiktoken
 
 
-# Stopwords ES + EN (recortadas del SAL original)
 STOPWORDS = frozenset("""
 the and for with from this that these those some any all each other such
 very just only also even still then than too much many more most less not
@@ -54,7 +47,6 @@ MAX_STATE_LOG = 1000
 MAX_SEQUENCE_LEN = 50
 MAX_TRANSITIONS = 50000
 MAX_DELAYS_PER_TRANSITION = 100
-# Cota por token para evitar O(n²) en `_min_delay`
 MAX_POSITIONS_PER_TOKEN = 50
 
 
@@ -85,22 +77,18 @@ class Transition:
         return sum(self.delays) / len(self.delays) if self.delays else 0.0
 
 
-# Token de "palabra": letras Unicode de longitud >= 3 (sin dígitos ni _).
 _WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 
 class CorpusObserver:
     """Observa el corpus y extrae símbolos, secuencias y transiciones.
 
-    Uso:
-        obs = CorpusObserver()
-        for chunk in chunks:
-            obs.observe(chunk)
+    Nota (v4.2.1): `enc_name` se conserva por compatibilidad de firma, pero
+    el tokenizador real es regex `_WORD_RE`. No instancies `tiktoken`.
     """
 
     def __init__(self, enc_name: str = "gpt2"):
         self.enc_name = enc_name
-        self._enc = None
         self.observations: list[Observation] = []
         self.vocabulary: Counter = Counter()
         self.transitions: dict[tuple[str, str], Transition] = {}
@@ -115,14 +103,8 @@ class CorpusObserver:
             "sequences": 0,
         }
 
-    def _encoding(self):
-        if self._enc is None:
-            self._enc = tiktoken.get_encoding(self.enc_name)
-        return self._enc
-
     # ---------------------------------------------------------- tokenización
     def tokenize(self, text: str) -> list[str]:
-        """Tokeniza a palabras significativas (sin stopwords, min length)."""
         if not text:
             return []
         raw = _WORD_RE.findall(text.lower())
@@ -130,7 +112,6 @@ class CorpusObserver:
 
     # ---------------------------------------------------------- observación
     def observe(self, text: str, ref: str = "") -> Observation:
-        """Registra una ventana de texto y actualiza contadores."""
         self.chunk_counter += 1
         tokens = self.tokenize(text)
         obs = Observation(
@@ -147,7 +128,6 @@ class CorpusObserver:
         for t in tokens:
             self.vocabulary[t] += 1
 
-        # Secuencias de hasta 10 tokens (ventana deslizante)
         for i in range(len(tokens)):
             window = tokens[i : i + 10]
             if len(window) >= 2:
@@ -155,10 +135,8 @@ class CorpusObserver:
         if len(self.sequences) > MAX_SEQUENCE_LEN * 100:
             self.sequences = self.sequences[-MAX_SEQUENCE_LEN * 100 :]
 
-        # Transiciones: pares (A, B) con delay en caracteres
         self._record_transitions(text, tokens)
 
-        # state_log: registro plano para mining tipo SAL
         self.state_log.append({
             "at": obs.at,
             "chunk_id": self.chunk_counter,
@@ -173,14 +151,12 @@ class CorpusObserver:
         return obs
 
     def _record_transitions(self, text: str, tokens: list[str]) -> None:
-        """Cuenta pares (A→B) con delay entre ocurrencias en el texto."""
         positions: dict[str, list[int]] = defaultdict(list)
         for m in _WORD_RE.finditer(text.lower()):
             tok = m.group()
             if tok in STOPWORDS or len(tok) < MIN_TOKEN_LEN:
                 continue
             lst = positions[tok]
-            # Cota por token para mantener `_min_delay` acotado.
             if len(lst) < MAX_POSITIONS_PER_TOKEN:
                 lst.append(m.start())
 
@@ -192,6 +168,11 @@ class CorpusObserver:
                 pair = (a, b)
                 if pair in seen_pairs:
                     continue
+
+                # FIX v4.2.1: no pagar `_min_delay` si el par no se puede registrar
+                if pair not in self.transitions and len(self.transitions) >= MAX_TRANSITIONS:
+                    continue
+
                 delay = self._min_delay(positions[a], positions[b])
                 if delay is None:
                     continue
@@ -202,8 +183,6 @@ class CorpusObserver:
                     continue
                 seen_pairs.add(pair)
                 if pair not in self.transitions:
-                    if len(self.transitions) >= MAX_TRANSITIONS:
-                        continue
                     self.transitions[pair] = Transition(a=a, b=b)
                 self.transitions[pair].record(delay)
 
@@ -223,7 +202,6 @@ class CorpusObserver:
 
     # ---------------------------------------------------------- símbolos
     def candidate_symbols(self) -> list[tuple[str, int]]:
-        """Tokens con suficientes ocurrencias para ser símbolo."""
         return [
             (t, c)
             for t, c in self.vocabulary.items()
@@ -231,7 +209,6 @@ class CorpusObserver:
         ]
 
     def candidate_transitions(self) -> list[tuple[str, str, int]]:
-        """Pares (A, B, count) con suficientes ocurrencias para ser regla."""
         out = []
         for (a, b), tr in self.transitions.items():
             if tr.count >= MIN_OCCURRENCES_FOR_RULE:
