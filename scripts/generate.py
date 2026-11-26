@@ -1,10 +1,8 @@
-"""Genera texto desde un checkpoint, con RAG y/o LoRA opcionales.
+"""Genera texto desde un checkpoint v4.3 con RAG, LoRA y reasoning bias.
 
-FIX v4.2.1:
-  - SignalProbe soporta RTModelWrapper (vía `signals.py`).
-  - Nota: el orden `load_lora` → `merge_lora` es intencional. Si el usuario
-    pasa `--lora` + `--merge-lora` sobre un checkpoint que ya tenía LoRA,
-    el adapter nuevo se mergea sobre los pesos base del ckpt.
+Uso:
+    python scripts/generate.py --ckpt checkpoints/run1/best.pt \\
+        --prompt "def quicksort" --reasoning-bias --verify
 """
 from __future__ import annotations
 
@@ -21,6 +19,7 @@ from snn_lm_v4 import (
     SignalProbe, load_graph,
     KnowledgeBase, make_model_encoder, make_sentence_transformer_encoder,
     apply_lora, load_lora, merge_lora, is_lora_active,
+    TokenSymbolMapper, ReasoningBias,
 )
 from snn_lm_v4.checkpoint import load_checkpoint
 
@@ -43,24 +42,36 @@ def parse_args():
     p.add_argument("--chunk-size", type=int, default=500)
 
     p.add_argument("--update-memory", action="store_true",
-                   help="Actualizar memoria episódica con la generación "
-                        "(continual learning). Default: False.")
+                   help="Actualizar memoria episódica con la generación.")
 
     # RAG
-    p.add_argument("--rag", action="store_true", help="Activar RAG")
-    p.add_argument("--kb", default=None, help="Ruta al KnowledgeBase (.pt)")
+    p.add_argument("--rag", action="store_true")
+    p.add_argument("--kb", default=None)
     p.add_argument("--rag-k", type=int, default=4)
     p.add_argument("--rag-max-chars", type=int, default=2000)
-    p.add_argument("--rag-encoder", default="hidden",
-                   help="'hidden' o 'sentence_transformer:<name>'")
+    p.add_argument("--rag-encoder", default="hidden")
 
     # LoRA
-    p.add_argument("--lora", default=None, help="Ruta al adapter LoRA")
+    p.add_argument("--lora", default=None)
     p.add_argument("--lora-r", type=int, default=8)
     p.add_argument("--lora-alpha", type=float, default=16.0)
-    p.add_argument("--lora-targets", nargs="+", default=["qkv", "proj", "fc1", "fc2"])
-    p.add_argument("--merge-lora", action="store_true",
-                   help="Fusionar LoRA en los pesos base tras cargar")
+    p.add_argument("--lora-targets", nargs="+", default=None)
+    p.add_argument("--merge-lora", action="store_true")
+
+    # Reasoning bias (v4.3)
+    p.add_argument("--reasoning-bias", action="store_true",
+                   help="Activa bias de reglas en logits.")
+    p.add_argument("--no-reasoning-bias", action="store_true",
+                   help="Desactiva bias aunque config lo tenga enabled.")
+    p.add_argument("--reasoning-bias-strength", type=float, default=None)
+    p.add_argument("--reasoning-bias-top-k", type=int, default=None)
+    p.add_argument("--reasoning-bias-remine-every", type=int, default=None)
+    p.add_argument("--reasoning-bias-facts-window", type=int, default=None)
+    p.add_argument("--reasoning-bias-min-confidence", type=float, default=None)
+    p.add_argument("--reasoning-mapper", default=None,
+                   help="Path al TokenSymbolMapper (.pt).")
+    p.add_argument("--reasoning-graph", default=None,
+                   help="Path al ReasoningGraph (.pt) para bias.")
     return p.parse_args()
 
 
@@ -100,6 +111,77 @@ def build_rag_kb(args, model):
     return kb
 
 
+def build_reasoning_bias_from_cli(args, cfg):
+    """Construye ReasoningBias si los flags lo piden. None si no aplica."""
+    if args.no_reasoning_bias:
+        return None
+
+    enabled = (
+        args.reasoning_bias
+        or getattr(cfg, "reasoning_bias_enabled", False)
+    )
+    if not enabled:
+        return None
+
+    graph_path = args.reasoning_graph or getattr(cfg, "reasoning_graph_path", "")
+    mapper_path = args.reasoning_mapper or getattr(cfg, "reasoning_mapper_path", "")
+
+    if not graph_path or not os.path.exists(graph_path):
+        raise SystemExit(
+            f"--reasoning-bias requires graph at {graph_path!r}. "
+            f"Pass --reasoning-graph or set config.reasoning_graph_path."
+        )
+    if not mapper_path or not os.path.exists(mapper_path):
+        raise SystemExit(
+            f"--reasoning-bias requires mapper at {mapper_path!r}. "
+            f"Pass --reasoning-mapper or set config.reasoning_mapper_path."
+        )
+
+    graph = load_graph(graph_path)
+    mapper = TokenSymbolMapper.load(mapper_path)
+
+    strength = (
+        args.reasoning_bias_strength
+        if args.reasoning_bias_strength is not None
+        else getattr(cfg, "reasoning_bias_strength", 0.1)
+    )
+    top_k = (
+        args.reasoning_bias_top_k
+        if args.reasoning_bias_top_k is not None
+        else getattr(cfg, "reasoning_bias_top_k", 16)
+    )
+    remine_every = (
+        args.reasoning_bias_remine_every
+        if args.reasoning_bias_remine_every is not None
+        else getattr(cfg, "reasoning_bias_remine_every", 8)
+    )
+    facts_window = (
+        args.reasoning_bias_facts_window
+        if args.reasoning_bias_facts_window is not None
+        else getattr(cfg, "reasoning_bias_facts_window", 8)
+    )
+    min_conf = (
+        args.reasoning_bias_min_confidence
+        if args.reasoning_bias_min_confidence is not None
+        else getattr(cfg, "reasoning_bias_min_confidence", 0.5)
+    )
+
+    bias = ReasoningBias(
+        graph=graph,
+        mapper=mapper,
+        strength=strength,
+        top_k=top_k,
+        remine_every=remine_every,
+        facts_window=facts_window,
+        min_confidence=min_conf,
+    )
+    print(
+        f"ReasoningBias: {len(mapper)} símbolos, strength={strength}, "
+        f"top_k={top_k}, remine_every={remine_every}"
+    )
+    return bias
+
+
 def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
@@ -107,7 +189,10 @@ def main():
     device = resolve_device(args.device)
     ckpt = load_checkpoint(args.ckpt, SNNLM, device)
     model, cfg, step = ckpt["model"], ckpt["config"], ckpt["step"]
-    print(f"Checkpoint step={step}, params={model.num_params():,}, RT={ckpt['use_rt']}")
+    print(
+        f"Checkpoint step={step}, params={model.num_params():,}, "
+        f"RT={ckpt['use_rt']}, core={ckpt.get('core_type', cfg.core_type)}"
+    )
 
     if args.lora:
         if not os.path.exists(args.lora):
@@ -115,7 +200,7 @@ def main():
         if not is_lora_active(model):
             apply_lora(
                 model, r=args.lora_r, alpha=args.lora_alpha,
-                targets=tuple(args.lora_targets),
+                targets=tuple(args.lora_targets) if args.lora_targets else None,
             )
         meta = load_lora(model, args.lora)
         print(f"LoRA cargado: {args.lora} (meta={meta})")
@@ -130,6 +215,8 @@ def main():
     if graph is not None:
         print(f"Grafo: {graph.get_state()['rules_count']} reglas")
 
+    reasoning_bias = build_reasoning_bias_from_cli(args, cfg)
+
     verifier = ConsistencyVerifier() if args.verify else None
     probe = None
     if args.verify and cfg.snn_track_stats:
@@ -141,6 +228,9 @@ def main():
 
     for i in range(args.samples):
         seed = None if args.seed is None else args.seed + i
+        if reasoning_bias is not None:
+            reasoning_bias.reset()
+
         text = generate(
             model, prompt=args.prompt,
             max_new_tokens=args.max_tokens,
@@ -152,9 +242,14 @@ def main():
             rag_kb=rag_kb,
             rag_top_k=args.rag_k,
             rag_max_context_chars=args.rag_max_chars,
+            reasoning_bias=reasoning_bias,
+            auto_reasoning_bias=False,  # ya construido arriba o desactivado
         )
         print(f"\n--- muestra {i + 1} ---")
         print(text)
+
+        if reasoning_bias is not None:
+            print(f"[bias] {reasoning_bias.get_state()}")
 
         if verifier is not None and graph is not None and observer is not None:
             problems = verifier.verify_against_corpus(text, graph, observer)
