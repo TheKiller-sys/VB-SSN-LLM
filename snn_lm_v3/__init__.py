@@ -16,7 +16,10 @@ from .model import SNNLM
 from .memory import (
     NeuralMemory, AbstractionHead, SelfKnowledgeHead, LatentReasoner,
 )
-from .dataset import TextDataset, load_texts, make_dataloader, make_rt_dataloader
+from .dataset import (
+    TextDataset, load_texts, load_texts_with_paths,
+    make_dataloader, make_rt_dataloader, CODE_EXTENSIONS,
+)
 from .train import train, evaluate
 from .generate import generate
 from .checkpoint import save_checkpoint, load_checkpoint
@@ -52,7 +55,8 @@ __all__ = [
     # memory
     "NeuralMemory", "AbstractionHead", "SelfKnowledgeHead", "LatentReasoner",
     # data
-    "TextDataset", "load_texts", "make_dataloader", "make_rt_dataloader",
+    "TextDataset", "load_texts", "load_texts_with_paths",
+    "make_dataloader", "make_rt_dataloader", "CODE_EXTENSIONS",
     # training
     "train", "evaluate", "generate", "save_checkpoint", "load_checkpoint",
     # analyzer
