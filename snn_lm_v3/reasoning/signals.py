@@ -1,13 +1,9 @@
 """Extracción de señales internas del modelo SNN-LM.
 
-Las señales son el equivalente LM de `neuralState` del sistema cognitivo JS:
-  - mean_spike_rate    ~ actividad del sustrato
-  - output_entropy     ~ incertidumbre
-  - attention_entropy  ~ foco
-  - perplexity         ~ calidad
-  - max_prob           ~ confianza
-  - kv_norm            ~ carga de contexto
-  - spike_variance     ~ coherencia entre capas
+FIX v4.2.1:
+  - `SignalProbe` soporta tanto `SNNLM` como `RTModelWrapper`.
+  - Con RT, usa `rv.encode` + `snnlm._forward(precomputed_embeddings=...)`.
+  - Todos los accesos internos van por `self._inner` (el SNNLM real).
 """
 from __future__ import annotations
 
@@ -17,6 +13,25 @@ import torch
 import torch.nn.functional as F
 
 from ..rope import apply_rope
+
+
+def _unwrap(model):
+    seen: set[int] = set()
+    while hasattr(model, "_orig_mod") and id(model) not in seen:
+        seen.add(id(model))
+        model = model._orig_mod
+    return model
+
+
+def _is_rt(model) -> bool:
+    model = _unwrap(model)
+    if model.__class__.__name__ == "RTModelWrapper":
+        return True
+    return (
+        hasattr(model, "rv")
+        and hasattr(model, "snnlm")
+        and hasattr(model.rv, "encode")
+    )
 
 
 @dataclass
@@ -45,17 +60,19 @@ class SignalProbe:
     Uso:
         probe = SignalProbe(model)
         sig = probe.probe("The quick brown fox")
-        # sig.mean_spike_rate, sig.output_entropy, ...
 
     Nota: para que `mean_spike_rate` sea significativo, el modelo debe haberse
     construido con `snn_track_stats=True` en su GPTConfig.
     """
 
     def __init__(self, model, device=None, enc_name: str = "gpt2"):
-        self.model = model
-        self.device = device or next(model.parameters()).device
+        self.raw_model = model
+        self.model = _unwrap(model)
+        self._is_rt = _is_rt(self.model)
+        self._inner = self.model.snnlm if self._is_rt else self.model
+        self.device = device or next(self._inner.parameters()).device
         self.enc_name = enc_name
-        self.model.eval()
+        self._inner.eval()
         self._enc = None
 
     def _encoding(self):
@@ -66,16 +83,23 @@ class SignalProbe:
 
     @torch.no_grad()
     def probe(self, text: str, enc=None) -> InternalSignals:
-        if enc is None:
-            enc = self._encoding()
-        ids = enc.encode_ordinary(text)[: self.model.config.seq_len]
-        if len(ids) < 2:
-            ids = [enc.eot_token, enc.eot_token]
-        idx = torch.tensor([ids], dtype=torch.long, device=self.device)
-
-        # Un único forward: suficiente para entropy, max_prob y perplexity
-        # shifted. Además, NO contamina la memoria del modelo.
-        logits, _ = self.model(idx, update_memory=False)
+        if self._is_rt:
+            ids_list = self.model.rv.encode(text)[: self._inner.config.seq_len]
+            if len(ids_list) < 2:
+                ids_list = [0, 0]  # fallback: BOS/UNK duplicado
+            idx = torch.tensor([ids_list], dtype=torch.long, device=self.device)
+            q_emb, _, _ = self.model.rv.embed_and_quantize(idx, update=False)
+            logits, _, _, _ = self._inner._forward(
+                idx, update_memory=False, precomputed_embeddings=q_emb,
+            )
+        else:
+            if enc is None:
+                enc = self._encoding()
+            ids = enc.encode_ordinary(text)[: self._inner.config.seq_len]
+            if len(ids) < 2:
+                ids = [enc.eot_token, enc.eot_token]
+            idx = torch.tensor([ids], dtype=torch.long, device=self.device)
+            logits, _ = self._inner(idx, update_memory=False)
 
         probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
@@ -97,7 +121,7 @@ class SignalProbe:
 
         # Firing rates
         rates = []
-        for block in self.model.blocks:
+        for block in self._inner.blocks:
             lr = getattr(block.ffn, "last_firing_rate", None)
             if lr is not None:
                 rates.append(float(lr.item()))
@@ -117,13 +141,13 @@ class SignalProbe:
             max_prob=round(max_prob, 4),
             kv_norm=round(kv_norm, 3),
             spike_variance=round(variance, 6),
-            n_tokens=len(ids),
+            n_tokens=int(idx.size(1)),
         )
 
     def _kv_norm(self, idx) -> float:
         try:
-            block = self.model.blocks[0]
-            x = self.model.drop(self.model.tok_emb(idx))
+            block = self._inner.blocks[0]
+            x = self._inner.drop(self._inner.tok_emb(idx))
             qkv = block.attn.qkv(block.ln1(x))
             _, k, _ = qkv.chunk(3, dim=-1)
             return float(k.norm(dim=-1).mean().item())
@@ -131,11 +155,10 @@ class SignalProbe:
             return 0.0
 
     def _attention_entropy(self, idx) -> float:
-        """Entropía de atención de la capa 0 recomputada con RoPE aplicado,
-        de modo que coincida con la atención real del modelo."""
+        """Entropía de atención de la capa 0 con RoPE aplicado."""
         try:
-            block = self.model.blocks[0]
-            x = self.model.drop(self.model.tok_emb(idx))
+            block = self._inner.blocks[0]
+            x = self._inner.drop(self._inner.tok_emb(idx))
             qkv = block.attn.qkv(block.ln1(x))
             q, k, _ = qkv.chunk(3, dim=-1)
             B, T, C = q.shape
@@ -143,9 +166,8 @@ class SignalProbe:
             D = block.attn.head_dim
             q = q.view(B, T, H, D).transpose(1, 2)
             k = k.view(B, T, H, D).transpose(1, 2)
-            # RoPE igual que en MultiHeadAttention
-            cos = self.model.rope_cos[:T].unsqueeze(0).unsqueeze(0)
-            sin = self.model.rope_sin[:T].unsqueeze(0).unsqueeze(0)
+            cos = self._inner.rope_cos[:T].unsqueeze(0).unsqueeze(0)
+            sin = self._inner.rope_sin[:T].unsqueeze(0).unsqueeze(0)
             q, k = apply_rope(q, k, cos, sin)
             att = (q @ k.transpose(-2, -1)) / (D ** 0.5)
             mask = torch.triu(
