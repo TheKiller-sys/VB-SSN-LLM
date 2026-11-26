@@ -1,9 +1,11 @@
-"""Guardado y carga de checkpoints con soporte RT, LoRA y validación estricta.
+"""Guardado y carga de checkpoints con soporte RT, LoRA, y core_type
+(attention|temporal).
 
-FIX v4.2.1:
-  - `load_checkpoint` toma `r`/`alpha` reales desde `lora_state` (por módulo),
-    no desde `lora_config` (que puede estar desincronizado).
-  - Detección robusta de `r`/`alpha` mixtos en el adapter.
+v4.3:
+  - Detecta `core_type` del state_dict y lo valida contra `config.core_type`.
+  - Migra checkpoints v4.2.1 (`.attn.*`) a v4.3 (`.core.*`) automáticamente
+    cuando `core_type="attention"`.
+  - Rechaza cargar checkpoints temporales en modelos attention (y viceversa).
 """
 from __future__ import annotations
 
@@ -13,18 +15,17 @@ import os
 import numpy as np
 import torch
 
-CKPT_VERSION = 5  # bumped: LoRA-aware + memory-aware
+CKPT_VERSION = 6  # bumped: core_type aware
 
 
-# Buffers persistent=False que NO aparecen en state_dict y por tanto pueden
-# aparecer como "missing" en PyTorch antiguos. Filtro explícito (no substrings).
+# Buffers persistent=False que NO aparecen en state_dict.
 _IGNORE_MISSING_EXACT = {
     "rope_cos", "rope_sin",
     "last_firing_rate",
 }
 _IGNORE_MISSING_SUFFIXES = (
-    ".keys", ".values", ".ptr", ".size",       # NeuralMemory buffers
-    ".last_firing_rate",                       # track_stats buffers
+    ".keys", ".values", ".ptr", ".size",
+    ".last_firing_rate",
 )
 
 
@@ -49,6 +50,36 @@ def _has_lora_keys(state_dict: dict) -> bool:
     return any(".lora_A" in k or ".lora_B" in k for k in state_dict.keys())
 
 
+def _detect_ckpt_core_type(state_dict: dict) -> str | None:
+    """Detecta el core_type de un state_dict.
+
+    Devuelve:
+        "temporal" si hay claves `.core.in_proj.`/`.core.out_proj.`
+        "attention" si hay claves `.core.qkv.`/`.core.proj.`
+        "attention" si hay claves legacy `.attn.qkv.`/`.attn.proj.` (v4.2.1)
+        None si no se detecta.
+    """
+    for k in state_dict.keys():
+        if ".core.in_proj." in k or ".core.out_proj." in k:
+            return "temporal"
+        if ".core.qkv." in k or ".core.proj." in k:
+            return "attention"
+        if ".attn.qkv." in k or ".attn.proj." in k:
+            return "attention"  # legacy v4.2.1
+    return None
+
+
+def _migrate_legacy_attention_keys(state_dict: dict) -> dict:
+    """v4.2.1 usaba `self.attn`; v4.3 usa `self.core`. Remap."""
+    out = {}
+    for k, v in state_dict.items():
+        if ".attn." in k:
+            out[k.replace(".attn.", ".core.")] = v
+        else:
+            out[k] = v
+    return out
+
+
 def _is_ignorable_missing(key: str) -> bool:
     if key in _IGNORE_MISSING_EXACT:
         return True
@@ -56,8 +87,6 @@ def _is_ignorable_missing(key: str) -> bool:
 
 
 def _extract_lora_r_alpha(ckpt: dict, cfg) -> tuple[int, float]:
-    """Devuelve (r, alpha) autoritativos desde `lora_state`, con fallback a
-    `lora_config` y luego a `cfg`."""
     lora_cfg = ckpt.get("lora_config") or {}
     lora_state = ckpt.get("lora_state") or {}
 
@@ -75,7 +104,9 @@ def _extract_lora_r_alpha(ckpt: dict, cfg) -> tuple[int, float]:
                 f"Non-uniform alpha is not supported."
             )
         r = int(next(iter(rs))) if rs else int(lora_cfg.get("r", cfg.lora_r))
-        alpha = float(next(iter(alphas))) if alphas else float(lora_cfg.get("alpha", cfg.lora_alpha))
+        alpha = float(next(iter(alphas))) if alphas else float(
+            lora_cfg.get("alpha", cfg.lora_alpha)
+        )
         return r, alpha
 
     return (
@@ -124,6 +155,7 @@ def save_checkpoint(
             "dropout": config.lora_dropout,
             "targets": list(config.lora_targets),
         } if lora_active else None,
+        "core_type": getattr(config, "core_type", "attention"),
         "rng_state": {
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
@@ -149,6 +181,12 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
 
     from .config import GPTConfig
     raw = ckpt["config"]
+
+    # v4.2.1 no tenía core_type; default "attention"
+    if "core_type" not in raw:
+        raw = dict(raw)
+        raw["core_type"] = "attention"
+
     cfg = GPTConfig(**{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__})
 
     ckpt_vocab = raw.get("vocab_size")
@@ -161,7 +199,22 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
 
     use_rt = ckpt.get("use_rt", False)
     use_lora = ckpt.get("use_lora", False)
-    state_dict = ckpt["model"]
+    state_dict = dict(ckpt["model"])
+
+    # Detectar core_type del state_dict
+    ckpt_core = _detect_ckpt_core_type(state_dict)
+    if ckpt_core is not None and ckpt_core != cfg.core_type:
+        raise ValueError(
+            f"Checkpoint has core_type={ckpt_core!r} but model config has "
+            f"core_type={cfg.core_type!r}. Cannot load incompatible cores. "
+            f"Reentrena desde cero o usa un checkpoint compatible."
+        )
+
+    # Migrar keys legacy v4.2.1 (`.attn.` -> `.core.`) si es attention
+    if ckpt_core == "attention" and any(".attn." in k for k in state_dict.keys()):
+        state_dict = _migrate_legacy_attention_keys(state_dict)
+        logging.info("Migradas claves legacy `.attn.*` -> `.core.*`")
+
     has_rt_state = _has_rt_keys(state_dict)
     has_lora_state = _has_lora_keys(state_dict)
 
@@ -189,7 +242,9 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     if use_rt:
         from .tokenizer import ResonantVocab, RVConfig, RTModelWrapper
         rv_data = ckpt.get("rt_config") or {}
-        rv_cfg = RVConfig(**{k: v for k, v in rv_data.items() if k in RVConfig.__dataclass_fields__})
+        rv_cfg = RVConfig(
+            **{k: v for k, v in rv_data.items() if k in RVConfig.__dataclass_fields__}
+        )
         bpe_path = ckpt.get("bpe_path")
         if not bpe_path or not os.path.exists(bpe_path):
             raise ValueError(
@@ -204,7 +259,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     if use_lora:
         from .lora import apply_lora
         lora_cfg = ckpt.get("lora_config") or {}
-        # ── FIX v4.2.1: r/alpha autoritativos vienen de lora_state ──
         r, alpha = _extract_lora_r_alpha(ckpt, cfg)
         apply_lora(
             model,
@@ -218,7 +272,6 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
     if unexpected:
         raise ValueError(f"Unexpected keys in checkpoint: {unexpected[:10]}")
 
-    # ── FIX v4.2: filtro robusto (sin substrings frágiles) ──
     real_missing = [k for k in missing if not _is_ignorable_missing(k)]
     if real_missing:
         raise ValueError(f"Missing parameters in checkpoint: {real_missing[:10]}")
@@ -240,6 +293,7 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
         "best_val_loss": ckpt.get("best_val_loss"),
         "use_rt": use_rt,
         "use_lora": use_lora,
+        "core_type": cfg.core_type,
     }
 
     if load_optimizer:
