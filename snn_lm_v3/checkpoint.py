@@ -1,4 +1,10 @@
-"""Guardado y carga de checkpoints con soporte RT, LoRA y validación estricta."""
+"""Guardado y carga de checkpoints con soporte RT, LoRA y validación estricta.
+
+FIX v4.2.1:
+  - `load_checkpoint` toma `r`/`alpha` reales desde `lora_state` (por módulo),
+    no desde `lora_config` (que puede estar desincronizado).
+  - Detección robusta de `r`/`alpha` mixtos en el adapter.
+"""
 from __future__ import annotations
 
 import logging
@@ -47,6 +53,35 @@ def _is_ignorable_missing(key: str) -> bool:
     if key in _IGNORE_MISSING_EXACT:
         return True
     return any(key.endswith(s) for s in _IGNORE_MISSING_SUFFIXES)
+
+
+def _extract_lora_r_alpha(ckpt: dict, cfg) -> tuple[int, float]:
+    """Devuelve (r, alpha) autoritativos desde `lora_state`, con fallback a
+    `lora_config` y luego a `cfg`."""
+    lora_cfg = ckpt.get("lora_config") or {}
+    lora_state = ckpt.get("lora_state") or {}
+
+    if lora_state:
+        rs = {int(e["r"]) for e in lora_state.values() if "r" in e}
+        alphas = {float(e["alpha"]) for e in lora_state.values() if "alpha" in e}
+        if len(rs) > 1:
+            raise ValueError(
+                f"LoRA state has mixed r values: {sorted(rs)}. "
+                f"Non-uniform r is not supported."
+            )
+        if len(alphas) > 1:
+            raise ValueError(
+                f"LoRA state has mixed alpha values: {sorted(alphas)}. "
+                f"Non-uniform alpha is not supported."
+            )
+        r = int(next(iter(rs))) if rs else int(lora_cfg.get("r", cfg.lora_r))
+        alpha = float(next(iter(alphas))) if alphas else float(lora_cfg.get("alpha", cfg.lora_alpha))
+        return r, alpha
+
+    return (
+        int(lora_cfg.get("r", cfg.lora_r)),
+        float(lora_cfg.get("alpha", cfg.lora_alpha)),
+    )
 
 
 def save_checkpoint(
@@ -167,12 +202,14 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
         model = model_class(cfg)
 
     if use_lora:
-        from .lora import apply_lora, load_lora_state_dict
+        from .lora import apply_lora
         lora_cfg = ckpt.get("lora_config") or {}
+        # ── FIX v4.2.1: r/alpha autoritativos vienen de lora_state ──
+        r, alpha = _extract_lora_r_alpha(ckpt, cfg)
         apply_lora(
             model,
-            r=int(lora_cfg.get("r", cfg.lora_r)),
-            alpha=float(lora_cfg.get("alpha", cfg.lora_alpha)),
+            r=r,
+            alpha=alpha,
             dropout=float(lora_cfg.get("dropout", cfg.lora_dropout)),
             targets=tuple(lora_cfg.get("targets", cfg.lora_targets)),
         )
