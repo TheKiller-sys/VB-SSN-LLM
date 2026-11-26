@@ -1,11 +1,8 @@
-"""Analizador continuo en background para SNN-LM v4.1.
+"""Analizador continuo en background para SNN-LM v4.2.1.
 
-Tareas (round-robin):
-  1. Podar memoria neural (thread-safe vía `NeuralMemory.prune()`).
-  2. Refrescar codebooks (thread-safe vía `.reinit_dead_codes()`).
-  3. Tareas extra del usuario.
-
-Todo bajo torch.no_grad(). Hilo daemon.
+FIX v4.2.1:
+  - `_get_rt_vocab` / `_get_abstraction_head` solo ignoran `ModuleNotFoundError`
+    cuando el módulo faltante es `tokenizers` (no cualquier ImportError).
 """
 from __future__ import annotations
 
@@ -28,23 +25,30 @@ def _unwrap(model):
     return model
 
 
-def _get_rt_vocab(model):
+def _try_import_rt():
+    """Devuelve RTModelWrapper o None. Solo silencia si falta `tokenizers`."""
     try:
         from .tokenizer import RTModelWrapper
-        if isinstance(model, RTModelWrapper):
-            return model.rv
-    except ImportError:
-        pass
+        return RTModelWrapper
+    except ModuleNotFoundError as e:
+        if e.name and "tokenizers" not in e.name and "sentencepiece" not in e.name:
+            raise
+        return None
+
+
+def _get_rt_vocab(model):
+    RTModelWrapper = _try_import_rt()
+    if RTModelWrapper is None:
+        return None
+    if isinstance(model, RTModelWrapper):
+        return model.rv
     return None
 
 
 def _get_abstraction_head(model):
-    try:
-        from .tokenizer import RTModelWrapper
-        if isinstance(model, RTModelWrapper):
-            return getattr(model.snnlm, "abstraction_head", None)
-    except ImportError:
-        pass
+    RTModelWrapper = _try_import_rt()
+    if RTModelWrapper is not None and isinstance(model, RTModelWrapper):
+        return getattr(model.snnlm, "abstraction_head", None)
     return getattr(model, "abstraction_head", None)
 
 
@@ -155,7 +159,6 @@ class ContinuousAnalyzer:
         return result
 
     def _prune_memory(self) -> dict:
-        """Thread-safe: delega a `NeuralMemory.prune()`."""
         mem = getattr(self.model, "neural_memory", None)
         if mem is None:
             return {"pruned": 0, "reason": "no_memory"}
@@ -165,7 +168,6 @@ class ContinuousAnalyzer:
         return {"pruned": removed, "size": int(mem.size.item())}
 
     def _refresh_codebooks(self) -> dict:
-        """Thread-safe: delega a `.reinit_dead_codes()`."""
         result = {"reinit_abs": 0, "reinit_rt": 0}
         abs_head = _get_abstraction_head(self.model)
         rv = _get_rt_vocab(self.model)
