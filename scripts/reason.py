@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 
-from snn_lm_v3 import (
+from snn_lm_v4 import (
     load_texts,
     CorpusObserver,
     ReasoningGraph,
