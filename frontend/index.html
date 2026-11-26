@@ -1,51 +1,53 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="es" class="dark">
 <head>
-  <meta charset="UTF-8">
-  <title>SNN-LM Dashboard</title>
-  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SNN-LM v4.3</title>
+<script src="https://unpkg.com/htmx.org@1.9.10"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  html { color-scheme: dark; }
+  .tab { @apply px-3 py-1.5 rounded text-sm cursor-pointer; }
+  .tab.active { @apply bg-blue-600 text-white; }
+  .tab:not(.active) { @apply bg-slate-800 text-slate-300 hover:bg-slate-700; }
+  .btn { @apply px-3 py-1.5 rounded text-sm bg-slate-700 hover:bg-slate-600; }
+  .btn-primary { @apply bg-blue-600 hover:bg-blue-500; }
+  .btn-danger { @apply bg-red-600 hover:bg-red-500; }
+  .input { @apply w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-sm; }
+  .card { @apply bg-slate-800 rounded p-4; }
+  .label { @apply text-xs uppercase text-slate-400 tracking-wide; }
+  .pre { @apply bg-black/60 p-3 rounded font-mono text-xs whitespace-pre-wrap max-h-96 overflow-auto; }
+  .badge { @apply inline-block px-2 py-0.5 rounded text-xs font-mono; }
+</style>
 </head>
-<body class="bg-slate-900 text-slate-100 font-mono p-6">
+<body class="bg-slate-950 text-slate-100 font-sans">
 
-<header class="flex justify-between items-center mb-6">
-  <h1 class="text-2xl font-bold">SNN-LM</h1>
-  <div id="model-info" class="text-sm text-slate-400"
-       hx-get="/api/model/info" hx-trigger="load, every 5s">
-    Cargando...
+<header class="flex items-center justify-between px-6 py-3 border-b border-slate-800">
+  <div class="flex items-center gap-4">
+    <h1 class="text-xl font-bold">SNN-LM <span class="text-blue-400">v4.3</span></h1>
+    <span id="model-badge" class="badge bg-slate-700">loading…</span>
+    <span id="jobs-badge" class="badge bg-slate-700">jobs: 0</span>
+  </div>
+  <div class="text-xs text-slate-400">
+    <span id="health-status">health: ?</span>
   </div>
 </header>
 
-<nav class="flex gap-2 mb-6">
-  <button class="px-3 py-1 rounded bg-slate-700"
-          hx-get="/api/model/info" hx-target="#panel">Model</button>
-  <button class="px-3 py-1 rounded bg-slate-700"
-          hx-get="/api/train/list" hx-target="#panel">Jobs</button>
-  <button class="px-3 py-1 rounded bg-slate-700"
-          hx-get="/api/files/list" hx-target="#panel">Files</button>
-</nav>
+<div class="flex min-h-[calc(100vh-3.5rem)]">
 
-<div class="grid grid-cols-2 gap-6">
-  <section class="bg-slate-800 p-4 rounded">
-    <h2 class="font-bold mb-2">Chat</h2>
-    <form hx-post="/api/chat/" hx-target="#chat-output"
-          hx-ext="json-enc" class="space-y-2">
-      <textarea name="prompt" rows="3"
-        class="w-full bg-slate-900 p-2 rounded"
-        placeholder="Prompt..."></textarea>
-      <input name="max_tokens" type="number" value="200"
-        class="w-24 bg-slate-900 p-1 rounded">
-      <button class="bg-blue-600 px-4 py-1 rounded">Generar</button>
-    </form>
-    <pre id="chat-output"
-         class="mt-4 bg-slate-900 p-3 rounded whitespace-pre-wrap min-h-[8rem]"></pre>
-  </section>
+  <aside class="w-56 border-r border-slate-800 p-3 space-y-1">
+    <div class="label mb-2">Workspace</div>
+    <div id="nav" class="space-y-1"></div>
+  </aside>
 
-  <section id="panel" class="bg-slate-800 p-4 rounded">
-    <h2 class="font-bold mb-2">Panel</h2>
-    <p class="text-slate-500">Selecciona una tab</p>
-  </section>
+  <main id="main" class="flex-1 p-6 overflow-auto"></main>
+
 </div>
 
+<!-- Toast -->
+<div id="toast" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
+
+<script src="/app.js"></script>
 </body>
 </html>
