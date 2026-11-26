@@ -1,10 +1,16 @@
 """Componentes de SNN: neurona LIF + FFN con modos configurables.
 
 Modos del FFN:
-  * static     -> surrogate spike por token (sin membrana)
-  * multi_step -> LIF con N pasos internos por token (paralelo en T, cache OK)
+  * static     -> spike binario por token (sin membrana)
+  * multi_step -> LIF con N pasos internos; salida BINARIA con STE
   * temporal   -> LIF a lo largo de la secuencia (BPTT, sin cache)
   * gelu       -> FFN estándar GPT-2
+
+Salida:
+  Todos los modos devuelven spikes BINARIOS {0, 1}. Para multi_step se
+  acumula el conteo interno y se binariza con straight-through estimator
+  (forward binario, backward == gradiente del conteo) para que el
+  gradiente no muera en el umbral.
 """
 from __future__ import annotations
 
@@ -37,13 +43,18 @@ def spike_fn(x: torch.Tensor, alpha: float = 2.0) -> torch.Tensor:
 
 # ---------------------------------------------------------------- LIF neuron
 class LIFNeuron(nn.Module):
-    """Leaky Integrate-and-Fire.
+    """Leaky Integrate-and-Fire con salida binaria y STE.
 
     Dinámica por paso:
         v_t = decay * v_{t-1} + I_t
         s_t = H(v_t - threshold)
         v_t = v_t - s_t * threshold        (soft reset)
         v_t = v_t * (1 - s_t)              (hard reset)
+
+    Salida:
+      - `forward(x, num_steps)`: spike BINARIO {0,1} (1 si disparó en
+        algún paso). STE para gradiente.
+      - `forward_temporal(x)`: spikes binarios por paso (BPTT).
     """
 
     def __init__(
@@ -89,10 +100,10 @@ class LIFNeuron(nn.Module):
 
     # ----------- variante 1: pasos internos por posición (paralelo en T)
     def forward(self, x: torch.Tensor, num_steps: int = 1) -> torch.Tensor:
-        """x: (B, T, C). Cada posición tiene su propia membrana independiente."""
+        """x: (B, T, C). Devuelve spike BINARIO {0,1} por posición."""
         B, T, C = x.shape
         v = torch.zeros_like(x)
-        total = torch.zeros_like(x)
+        fired_count = torch.zeros_like(x)
         decay = self._decay().to(x.dtype)
         threshold = self._threshold().to(x.dtype)
 
@@ -103,13 +114,16 @@ class LIFNeuron(nn.Module):
                 v = v - s * threshold
             else:
                 v = v * (1 - s)
-            total = total + s
+            fired_count = fired_count + s
 
-        return total
+        # ── FIX BINARIO: forward binario, backward == gradiente del conteo ──
+        binary = (fired_count > 0).to(x.dtype)
+        return fired_count + (binary - fired_count).detach()
 
     # ----------- variante 2: la secuencia ES el tiempo (BPTT real)
     def forward_temporal(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, T, C). T se interpreta como tiempo. BPTT canónico."""
+        """x: (B, T, C). T se interpreta como tiempo. BPTT canónico.
+        Devuelve spikes binarios por paso: (B, T, C)."""
         B, T, C = x.shape
         v = torch.zeros(B, C, device=x.device, dtype=x.dtype)
         decay = self._decay().to(x.dtype)
@@ -130,7 +144,7 @@ class LIFNeuron(nn.Module):
 
 # ---------------------------------------------------------------- spiking FFN
 class SpikingFFN(nn.Module):
-    """FFN con activación SNN configurable.
+    """FFN con activación SNN binaria configurable.
 
     `use_spiking=False` fuerza modo GELU. En otro caso se usa `mode`.
     """
@@ -190,19 +204,19 @@ class SpikingFFN(nn.Module):
             h = F.gelu(h)
 
         elif self.mode == "static":
-            s = spike_fn(h - self.threshold, self.alpha)
+            s = spike_fn(h - self.threshold, self.alpha)  # binario
             if self.track_stats:
                 self.last_firing_rate.copy_(s.detach().mean())
             h = s * h if self.residual else s
 
         elif self.mode == "multi_step":
-            s = self.lif(h, self.num_steps)
+            s = self.lif(h, self.num_steps)  # binario (STE)
             if self.track_stats:
-                self.last_firing_rate.copy_(s.detach().mean() / self.num_steps)
+                self.last_firing_rate.copy_(s.detach().mean())
             h = s * h if self.residual else s
 
         elif self.mode == "temporal":
-            s = self.lif.forward_temporal(h)
+            s = self.lif.forward_temporal(h)  # binario por paso
             if self.track_stats:
                 self.last_firing_rate.copy_(s.detach().mean())
             h = s * h if self.residual else s
@@ -215,7 +229,7 @@ class SpikingFFN(nn.Module):
 
 # ---------------------------------------------------------------- alias legacy
 class SpikingActivation(nn.Module):
-    """Compat: activación puntual (sin membrana)."""
+    """Compat: activación puntual (sin membrana). Salida binaria."""
 
     def __init__(
         self, threshold: float = 1.0, alpha: float = 2.0, residual: bool = True
