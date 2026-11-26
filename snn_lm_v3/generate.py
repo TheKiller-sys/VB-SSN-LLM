@@ -1,4 +1,4 @@
-"""Wrapper de generación: detecta RT sin importar el módulo, evita fallbacks silenciosos."""
+"""Wrapper de generación: detecta RT, integra RAG opcional."""
 from __future__ import annotations
 
 import torch
@@ -14,11 +14,9 @@ def _unwrap(model):
 
 
 def _is_rt_model(model) -> bool:
-    """Detecta RTModelWrapper sin importar `tokenizer` (funciona con torch.compile)."""
     model = _unwrap(model)
     if model.__class__.__name__ == "RTModelWrapper":
         return True
-    # Fallback: chequeo estructural (por si el nombre cambió)
     return (
         hasattr(model, "rv")
         and hasattr(model, "snnlm")
@@ -40,11 +38,23 @@ def generate(
     device=None,
     use_cache: bool = True,
     update_memory: bool = True,
+    rag_kb=None,
+    rag_top_k: int = 4,
+    rag_max_context_chars: int = 2000,
 ) -> str:
+    """Genera texto. Si `rag_kb` se da, enriquece el prompt con contexto recuperado."""
     device = device or next(model.parameters()).device
     model.eval()
     if seed is not None:
         torch.manual_seed(seed)
+
+    if rag_kb is not None:
+        from .rag import build_rag_prompt
+        prompt = build_rag_prompt(
+            prompt, rag_kb,
+            k=rag_top_k,
+            max_context_chars=rag_max_context_chars,
+        )
 
     is_rt = _is_rt_model(model)
 
@@ -57,7 +67,6 @@ def generate(
         )
         return model.decode(out[0].tolist())
 
-    # Standard tiktoken
     enc_name = enc_name or getattr(model.config, "enc_name", "cl100k_base")
     enc = tiktoken.get_encoding(enc_name)
     ids = enc.encode_ordinary(prompt) if prompt else [enc.eot_token]
