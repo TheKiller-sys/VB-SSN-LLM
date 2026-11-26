@@ -1,10 +1,12 @@
 """Añade documentos a un KnowledgeBase para RAG.
 
+Sin cambios respecto a v4.2.1: la KB es independiente del core del modelo.
+
 Ejemplos:
-    python scripts/add_knowledge.py --corpus data/noticias/ --out checkpoints/kb_news.pt \\
+    python scripts/add_knowledge.py --corpus data/noticias/ --out checkpoints/kb.pt \\
         --encoder hidden --ckpt checkpoints/best.pt
 
-    python scripts/add_knowledge.py --kb checkpoints/kb_news.pt \\
+    python scripts/add_knowledge.py --kb checkpoints/kb.pt \\
         --corpus data/articulos/ --encoder hidden --ckpt checkpoints/best.pt
 
     python scripts/add_knowledge.py --corpus data/ --out checkpoints/kb.pt \\
@@ -65,7 +67,10 @@ def build_encoder(args):
         ckpt = load_checkpoint(args.ckpt, SNNLM, device)
         model = ckpt["model"]
         cfg = ckpt["config"]
-        print(f"Encoder: hidden states de {args.ckpt} (dim={cfg.n_embd})")
+        print(
+            f"Encoder: hidden states de {args.ckpt} (dim={cfg.n_embd}, "
+            f"core={cfg.core_type})"
+        )
         return make_model_encoder(model), cfg.n_embd
     if args.encoder.startswith("sentence_transformer:"):
         name = args.encoder.split(":", 1)[1]
