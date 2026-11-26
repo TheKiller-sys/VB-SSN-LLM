@@ -3,15 +3,13 @@
 Componentes:
   - `KnowledgeBase`: vector store con similitud coseno, persistencia .pt.
   - `make_model_encoder(model)`: encoder usando hidden states del SNNLM.
-  - `make_sentence_transformer_encoder(name)`: encoder usando sentence-transformers (opcional).
-  - `generate_with_rag(model, prompt, kb, ...)`: wrapper sobre `generate()`.
+  - `make_sentence_transformer_encoder(name)`: encoder usando sentence-transformers.
+  - `build_rag_prompt(prompt, kb, ...)`: enriquece prompt con contexto.
 
 Diseño:
-  - Los embeddings se L2-normalizan al añadir → búsqueda por coseno = dot product.
-  - Thread-safe para lectura concurrente; `add()` toma lock exclusivo.
+  - Embeddings L2-normalizados al añadir -> búsqueda por coseno = dot product.
+  - Thread-safe para lectura concurrente; `add()` serializa la escritura.
   - Persistencia atómica (tmp + os.replace).
-  - Si `sentence_transformers` no está instalado, `make_sentence_transformer_encoder`
-    lanza ImportError con instrucciones claras. El encoder por defecto es el modelo.
 """
 from __future__ import annotations
 
@@ -29,15 +27,8 @@ logger = logging.getLogger(__name__)
 EncoderFn = Callable[[str], np.ndarray]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# KnowledgeBase
-# ─────────────────────────────────────────────────────────────────────
-
 class KnowledgeBase:
-    """Vector store mínimo para RAG. Indexa textos por embedding.
-
-    Thread-safe para `search()` concurrente. `add()` es exclusivo.
-    """
+    """Vector store mínimo para RAG. Indexa textos por embedding."""
 
     def __init__(
         self,
@@ -63,10 +54,7 @@ class KnowledgeBase:
         batch_size: int = 32,
         skip_empty: bool = True,
     ) -> int:
-        """Añade documentos al índice. Devuelve el número efectivamente añadidos.
-
-        Si `docs` hace exceder `max_docs`, se descartan los más antiguos (FIFO).
-        """
+        """Añade documentos. Trim FIFO si excede `max_docs`."""
         if self.encoder_fn is None:
             raise RuntimeError(
                 "KnowledgeBase.add requires `encoder_fn`. "
@@ -91,7 +79,7 @@ class KnowledgeBase:
                     )
                 norm = float(np.linalg.norm(emb))
                 if norm < 1e-8:
-                    continue  # embedding degenerado
+                    continue
                 emb = emb / norm
                 if not np.all(np.isfinite(emb)):
                     continue
@@ -102,10 +90,10 @@ class KnowledgeBase:
             return 0
 
         keys_arr = np.stack(new_keys, axis=0)
+        # Lectura y escritura de self.keys DENTRO del lock -> sin lost updates.
         with self._lock:
             self.keys = np.concatenate([self.keys, keys_arr], axis=0)
             self.texts.extend(new_texts)
-            # Trim FIFO
             overflow = len(self.texts) - self.max_docs
             if overflow > 0:
                 self.keys = self.keys[overflow:]
@@ -114,15 +102,7 @@ class KnowledgeBase:
         return len(new_texts)
 
     # ------------------------------------------------------------ search
-    def search(
-        self,
-        query: str,
-        k: int = 4,
-    ) -> list[tuple[str, float]]:
-        """Devuelve top-k (texto, score_coseno) para `query`.
-
-        Score ∈ [-1, 1]. Si el KB está vacío o el encoder no está, devuelve [].
-        """
+    def search(self, query: str, k: int = 4) -> list[tuple[str, float]]:
         if k <= 0:
             return []
         if self.encoder_fn is None:
@@ -132,7 +112,7 @@ class KnowledgeBase:
         with self._lock:
             if self.keys.shape[0] == 0:
                 return []
-            keys = self.keys  # referencia; numpy no muta el array
+            keys = self.keys
             texts = self.texts
 
         q = np.asarray(self.encoder_fn(query), dtype=np.float32)
@@ -145,10 +125,9 @@ class KnowledgeBase:
         if not np.all(np.isfinite(q)):
             return []
 
-        scores = keys @ q  # (N,) cosine
+        scores = keys @ q
         k_eff = min(k, scores.shape[0])
         top_idx = np.argpartition(-scores, k_eff - 1)[:k_eff]
-        # Ordenar los k por score descendente
         top_idx = top_idx[np.argsort(-scores[top_idx])]
         return [(texts[i], float(scores[i])) for i in top_idx]
 
@@ -193,7 +172,6 @@ class KnowledgeBase:
             )
         return kb
 
-    # ------------------------------------------------------------ info
     def __len__(self) -> int:
         return len(self.texts)
 
@@ -229,14 +207,10 @@ def make_model_encoder(
     enc_name: str = "cl100k_base",
     pooling: str = "mean",
 ) -> EncoderFn:
-    """Encoder que usa los hidden states del SNNLM (mean o last-token pooling).
+    """Encoder usando hidden states del SNNLM.
 
-    Compatible con SNNLM puro y RTModelWrapper. NO actualiza memoria ni KV-cache.
-
-    Args:
-        model: SNNLM o RTModelWrapper.
-        enc_name: tokenizer para SNNLM puro (ignorado si RT).
-        pooling: "mean" | "last".
+    IMPORTANTE: NO actualiza memoria ni KV-cache. Restaura el modo
+    `training`/`eval` original tras codificar.
     """
     if pooling not in ("mean", "last"):
         raise ValueError(f"pooling must be 'mean'|'last', got {pooling!r}")
@@ -253,35 +227,40 @@ def make_model_encoder(
 
     @torch.no_grad()
     def encode(text: str) -> np.ndarray:
-        model.eval()
-        if is_rt:
-            ids = model.rv.encode(text)
-            ids = ids[: model.config.seq_len]
-            if not ids:
-                ids = [0]
-            idx = torch.tensor([ids], dtype=torch.long, device=device)
-            q_emb, _, _ = model.rv.embed_and_quantize(idx, update=False)
-            logits, _, _, hidden = model.snnlm._forward(
-                idx, update_memory=False, precomputed_embeddings=q_emb,
-            )
-        else:
-            ids = _enc.encode_ordinary(text)[: model.config.seq_len]
-            if not ids:
-                ids = [_enc.eot_token]
-            idx = torch.tensor([ids], dtype=torch.long, device=device)
-            logits, _, _, hidden = model._forward(idx, update_memory=False)
+        was_training = model.training
+        model.eval()  # ── FIX v4.2: restaurar al final ──
+        try:
+            if is_rt:
+                ids = model.rv.encode(text)
+                ids = ids[: model.config.seq_len]
+                if not ids:
+                    ids = [0]
+                idx = torch.tensor([ids], dtype=torch.long, device=device)
+                q_emb, _, _ = model.rv.embed_and_quantize(idx, update=False)
+                logits, _, _, hidden = model.snnlm._forward(
+                    idx, update_memory=False, precomputed_embeddings=q_emb,
+                )
+            else:
+                ids = _enc.encode_ordinary(text)[: model.config.seq_len]
+                if not ids:
+                    ids = [_enc.eot_token]
+                idx = torch.tensor([ids], dtype=torch.long, device=device)
+                logits, _, _, hidden = model._forward(idx, update_memory=False)
 
-        if pooling == "mean":
-            vec = hidden.mean(dim=1)[0]
-        else:
-            vec = hidden[0, -1]
-        return vec.float().cpu().numpy()
+            if pooling == "mean":
+                vec = hidden.mean(dim=1)[0]
+            else:
+                vec = hidden[0, -1]
+            return vec.float().cpu().numpy()
+        finally:
+            if was_training:
+                model.train()
 
     return encode
 
 
 def make_sentence_transformer_encoder(name: str = "all-MiniLM-L6-v2") -> EncoderFn:
-    """Encoder independiente del SNNLM. Requiere `sentence-transformers` instalado."""
+    """Encoder independiente. Requiere `sentence-transformers`."""
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError as e:
@@ -301,7 +280,7 @@ def make_sentence_transformer_encoder(name: str = "all-MiniLM-L6-v2") -> Encoder
 
 
 # ─────────────────────────────────────────────────────────────────────
-# RAG-aware generate
+# RAG-aware prompt builder
 # ─────────────────────────────────────────────────────────────────────
 
 def build_rag_prompt(
@@ -311,10 +290,7 @@ def build_rag_prompt(
     max_context_chars: int = 2000,
     separator: str = "\n\n",
 ) -> str:
-    """Construye el prompt enriquecido con contexto recuperado.
-
-    Si no hay contexto (KB vacío o encoder ausente), devuelve `prompt` tal cual.
-    """
+    """Construye el prompt enriquecido con contexto recuperado."""
     if kb is None or len(kb) == 0:
         return prompt
     results = kb.search(prompt, k=k)
