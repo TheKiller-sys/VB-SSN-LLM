@@ -1,9 +1,12 @@
-"""Entrena SNN-LM v4.1 con o sin RT, con o sin código, con split por repo."""
+"""Entrena SNN-LM v4.2 con o sin RT, LoRA, o código, con split por repo."""
 from __future__ import annotations
 
 import argparse
 import logging
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -14,6 +17,7 @@ from snn_lm_v3 import (
     CorpusObserver, CodeCorpusObserver, ReasoningGraph,
     ConsistencyVerifier, save_graph, generate,
     ResonantVocab, RVConfig, RTModelWrapper,
+    apply_lora, freeze_base_for_lora, count_lora_params, save_lora,
 )
 from snn_lm_v3.dataset import CODE_EXTENSIONS
 from snn_lm_v3.checkpoint import load_checkpoint
@@ -45,21 +49,17 @@ def parse_args():
     p.add_argument("--snn-mode", choices=["static", "multi_step", "temporal", "gelu"], default=None)
     p.add_argument("--snn-steps", type=int, default=None)
     p.add_argument("--snn-track-stats", action="store_true")
-    p.add_argument("--analyzer", action="store_true",
-                   help="Activar ContinuousAnalyzer (prune + codebook refresh).")
+    p.add_argument("--analyzer", action="store_true")
     p.add_argument("--analyzer-interval", type=float, default=60.0)
 
     # Razonamiento
     p.add_argument("--no-reasoning", action="store_true")
-    p.add_argument("--code-corpus", action="store_true",
-                   help="Usar CodeCorpusObserver (para corpus de código).")
+    p.add_argument("--code-corpus", action="store_true")
     p.add_argument("--reasoning-chunk-size", type=int, default=500)
 
     # Corpus / split
-    p.add_argument("--split-by", choices=["file", "repo"], default="file",
-                   help="Split train/val: 'file' o 'repo' (evita val leak).")
-    p.add_argument("--extensions", nargs="+", default=[".txt"],
-                   help="Extensiones a incluir. Usa '.py' '.js' para código.")
+    p.add_argument("--split-by", choices=["file", "repo"], default="file")
+    p.add_argument("--extensions", nargs="+", default=[".txt"])
 
     # RT
     p.add_argument("--use-rt", action="store_true")
@@ -67,6 +67,21 @@ def parse_args():
     p.add_argument("--n-concepts", type=int, default=12_092)
     p.add_argument("--concept-dim", type=int, default=132)
     p.add_argument("--aux-loss-weight", type=float, default=0.1)
+
+    # LoRA (opcional; normalmente se usa scripts/train_lora.py)
+    p.add_argument("--lora", action="store_true",
+                   help="Aplicar LoRA sobre el modelo base (entrena solo A,B).")
+    p.add_argument("--lora-r", type=int, default=8)
+    p.add_argument("--lora-alpha", type=float, default=16.0)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--lora-targets", nargs="+", default=["qkv", "proj", "fc1", "fc2"])
+    p.add_argument("--lora-out", default=None,
+                   help="Ruta del adapter. Default: <out>/lora.pt")
+
+    # RAG (se guarda en config pero no se usa en training)
+    p.add_argument("--rag-kb", default=None,
+                   help="Ruta del KnowledgeBase a asociar al config.")
+    p.add_argument("--rag-top-k", type=int, default=4)
     return p.parse_args()
 
 
@@ -80,33 +95,26 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def build_reasoning_layer(
-    data_paths, chunk_size, logger, enc_name, use_code, extensions,
-):
-    """Construye el observer adecuado (prosa o código) y mina reglas."""
+def build_reasoning_layer(data_paths, chunk_size, logger, enc_name, use_code, extensions):
     if use_code:
         observer = CodeCorpusObserver(enc_name=enc_name)
-        logger.info("Usando CodeCorpusObserver (corpus de código)")
+        logger.info("Usando CodeCorpusObserver")
     else:
         observer = CorpusObserver(enc_name=enc_name)
-        logger.info("Usando CorpusObserver (prosa)")
+        logger.info("Usando CorpusObserver")
 
     graph = ReasoningGraph(cooldown_steps=3)
     docs = load_texts_with_paths(data_paths, extensions=tuple(extensions))
-    logger.info(f"Observando {len(docs)} documentos del corpus...")
+    logger.info(f"Observando {len(docs)} documentos...")
     for i, (path, content) in enumerate(docs):
         for j in range(0, len(content), chunk_size):
             observer.observe(content[j:j + chunk_size], ref=f"{path}:{j}")
 
-    state = observer.get_state()
-    logger.info(f"Observer state: {state}")
+    logger.info(f"Observer state: {observer.get_state()}")
     n_rules = graph.mine_from_corpus(observer)
     logger.info(
         f"ReasoningGraph: {n_rules} reglas nuevas, "
-        f"{graph.get_state()['rules_count']} totales "
-        f"({graph.metrics['cyclic_rejected']} cíclicas, "
-        f"{graph.metrics['overlap_rejected']} overlap, "
-        f"{graph.metrics['tautological_rejected']} tautológicas)"
+        f"{graph.get_state()['rules_count']} totales"
     )
     return observer, graph
 
@@ -150,7 +158,22 @@ def main():
         cfg.analyzer_enabled = True
         cfg.analyzer_interval_s = args.analyzer_interval
 
-    # ── RT setup ──
+    # RAG config
+    if args.rag_kb:
+        cfg.rag_enabled = True
+        cfg.rag_kb_path = args.rag_kb
+        cfg.rag_top_k = args.rag_top_k
+
+    # LoRA config
+    if args.lora:
+        cfg.lora_enabled = True
+        cfg.lora_r = args.lora_r
+        cfg.lora_alpha = args.lora_alpha
+        cfg.lora_dropout = args.lora_dropout
+        cfg.lora_targets = list(args.lora_targets)
+        cfg.lora_path = args.lora_out or os.path.join(cfg.out_dir, "lora.pt")
+
+    # RT setup
     if args.use_rt:
         cfg.use_rt = True
         cfg.rt_bpe_path = args.bpe_path
@@ -167,24 +190,20 @@ def main():
     os.makedirs(cfg.out_dir, exist_ok=True)
     cfg.save(os.path.join(cfg.out_dir, "config.json"))
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s",
+                        datefmt="%H:%M:%S")
     logger = logging.getLogger("train")
 
     set_seed(cfg.seed)
     device = resolve_device(cfg.device)
     logger.info(f"Device: {device}")
 
-    # ── Extensiones: si --code-corpus y no se especificaron, usar defaults de código
     extensions = args.extensions
     if args.code_corpus and extensions == [".txt"]:
         extensions = list(CODE_EXTENSIONS)
         logger.info(f"Extensiones de código auto: {len(extensions)} tipos")
 
-    # ── Razonamiento ──
+    # Razonamiento
     observer, graph = None, None
     if not args.no_reasoning:
         try:
@@ -200,7 +219,7 @@ def main():
             logger.warning(f"Razonamiento desactivado: {e}")
             observer, graph = None, None
 
-    # ── Modelo ──
+    # Modelo
     optimizer = None
     optimizer_state = None
     scheduler_state = None
@@ -216,10 +235,8 @@ def main():
         optimizer_state = ckpt.get("optimizer_state")
         scheduler_state = ckpt.get("scheduler_state")
         if optimizer_state is not None:
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay,
-                betas=(cfg.beta1, cfg.beta2), eps=1e-8,
-            )
+            from snn_lm_v3.train import _build_optimizer
+            optimizer = _build_optimizer(model, cfg, optimizer_state)
     else:
         snnlm = SNNLM(cfg)
         if cfg.use_rt:
@@ -236,12 +253,24 @@ def main():
         else:
             model = snnlm
 
-    logger.info(f"Parámetros: {model.num_params():,}")
+        # LoRA ANTES de train() (que hace compile)
+        if cfg.lora_enabled:
+            n = apply_lora(
+                model, r=cfg.lora_r, alpha=cfg.lora_alpha,
+                dropout=cfg.lora_dropout, targets=tuple(cfg.lora_targets),
+            )
+            freeze_base_for_lora(model)
+            logger.info(
+                f"LoRA: {n} módulos, {count_lora_params(model):,} params entrenables"
+            )
 
-    # ── Dataloaders ──
+    logger.info(f"Parámetros totales: {model.num_params():,}")
+
+    # Dataloaders
     if cfg.use_rt:
+        rv_ref = model.rv if hasattr(model, "rv") else model._orig_mod.rv
         train_dl, val_dl = make_rt_dataloader(
-            args.data, cfg.seq_len, cfg.batch_size, model.rv,
+            args.data, cfg.seq_len, cfg.batch_size, rv_ref,
             seed=cfg.seed, num_workers=cfg.num_workers,
             split_by=cfg.split_by, extensions=tuple(extensions),
         )
@@ -261,9 +290,19 @@ def main():
         best_val_loss=best_val_loss,
     )
 
-    # ── Verificación final ──
+    # Guardar adapter LoRA si aplica
+    if cfg.lora_enabled:
+        save_lora(model, cfg.lora_path, extra={
+            "step": int(cfg.max_steps),
+            "r": cfg.lora_r,
+            "alpha": cfg.lora_alpha,
+            "targets": list(cfg.lora_targets),
+        })
+        logger.info(f"Adapter LoRA guardado en {cfg.lora_path}")
+
+    # Verificación final
     if graph is not None and observer is not None:
-        logger.info("Verificación final contra corpus...")
+        logger.info("Verificación final...")
         text = generate(
             model, prompt="def " if args.code_corpus else "The quick brown",
             max_new_tokens=80, temperature=0.8, top_k=40, top_p=0.95,
