@@ -1,6 +1,6 @@
-"""SNN-LM v4.1 — Transformer causal con FFN de spikes, memoria neural,
-abstracción geométrica, autoconocimiento, razonamiento simbólico y
-Resonant Tokenizer (BPE + VQ)."""
+"""SNN-LM v4.2 — Transformer causal con FFN de spikes, memoria neural,
+abstracción geométrica, autoconocimiento, razonamiento simbólico,
+Resonant Tokenizer (BPE + VQ), RAG y LoRA."""
 from .config import (
     GPTConfig, resolve_device,
     SIZE_TINY, SIZE_SMALL, SIZE_MEDIUM, SIZE_LARGE, SIZES,
@@ -25,6 +25,21 @@ from .generate import generate
 from .checkpoint import save_checkpoint, load_checkpoint
 from .analyzer import ContinuousAnalyzer
 
+# RAG (v4.2)
+from .rag import (
+    KnowledgeBase,
+    make_model_encoder, make_sentence_transformer_encoder,
+    build_rag_prompt,
+)
+
+# LoRA (v4.2)
+from .lora import (
+    LoRALinear, apply_lora, freeze_base_for_lora,
+    lora_parameters, count_lora_params,
+    lora_state_dict, load_lora_state_dict,
+    save_lora, load_lora, merge_lora, is_lora_active,
+)
+
 # Resonant Tokenizer (v4.1)
 from .tokenizer import (
     ResonantVocab, RVConfig, RTModelWrapper,
@@ -39,7 +54,7 @@ from .reasoning import (
     save_graph, load_graph,
 )
 
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 __all__ = [
     # config
@@ -61,7 +76,15 @@ __all__ = [
     "train", "evaluate", "generate", "save_checkpoint", "load_checkpoint",
     # analyzer
     "ContinuousAnalyzer",
-    # RT (v4.1)
+    # RAG
+    "KnowledgeBase", "make_model_encoder", "make_sentence_transformer_encoder",
+    "build_rag_prompt",
+    # LoRA
+    "LoRALinear", "apply_lora", "freeze_base_for_lora",
+    "lora_parameters", "count_lora_params",
+    "lora_state_dict", "load_lora_state_dict",
+    "save_lora", "load_lora", "merge_lora", "is_lora_active",
+    # RT
     "ResonantVocab", "RVConfig", "RTModelWrapper",
     "train_bpe", "iter_corpus",
     # reasoning
