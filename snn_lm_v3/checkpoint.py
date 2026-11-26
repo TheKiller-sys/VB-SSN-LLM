@@ -1,4 +1,4 @@
-"""Guardado y carga de checkpoints con soporte RT."""
+"""Guardado y carga de checkpoints con soporte RT y validación estricta."""
 from __future__ import annotations
 
 import logging
@@ -7,21 +7,22 @@ import os
 import numpy as np
 import torch
 
-CKPT_VERSION = 4  # bumped: now RT-aware
+CKPT_VERSION = 4  # bumped: RT-aware
 
 
 def _unwrap(model):
-    while hasattr(model, "_orig_mod"):
+    """Unwraps torch.compile sin ciclos infinitos."""
+    seen: set[int] = set()
+    while hasattr(model, "_orig_mod") and id(model) not in seen:
+        seen.add(id(model))
         model = model._orig_mod
     return model
 
 
 def _is_rt(model) -> bool:
-    try:
-        from .tokenizer import RTModelWrapper
-        return isinstance(model, RTModelWrapper)
-    except ImportError:
-        return False
+    """Detección de RT sin importar el módulo (funciona con torch.compile)."""
+    model = _unwrap(model)
+    return model.__class__.__name__ == "RTModelWrapper"
 
 
 def save_checkpoint(
@@ -67,24 +68,53 @@ def save_checkpoint(
     os.replace(tmp, path)
 
 
+def _has_rt_keys(state_dict: dict) -> bool:
+    """Detecta si un state_dict contiene claves del ResonantVocab."""
+    return any(k.startswith("rv.") for k in state_dict.keys())
+
+
 def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool = False) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     version = ckpt.get("version", 0)
     if version != CKPT_VERSION:
-        logging.warning(f"Checkpoint version {version} != {CKPT_VERSION}. May be incompatible.")
+        logging.warning(
+            f"Checkpoint version {version} != {CKPT_VERSION}. May be incompatible."
+        )
 
     from .config import GPTConfig
     raw = ckpt["config"]
     cfg = GPTConfig(**{k: v for k, v in raw.items() if k in GPTConfig.__dataclass_fields__})
 
-    # Validate vocab
+    # Validar vocab
     ckpt_vocab = raw.get("vocab_size")
     if ckpt_vocab is not None:
         model_vocab = ckpt["model"]["tok_emb.weight"].shape[0]
         if ckpt_vocab != model_vocab:
-            raise ValueError(f"Checkpoint vocab {ckpt_vocab} != tok_emb shape {model_vocab}")
+            raise ValueError(
+                f"Checkpoint vocab {ckpt_vocab} != tok_emb shape {model_vocab}"
+            )
 
     use_rt = ckpt.get("use_rt", False)
+    state_dict = ckpt["model"]
+    has_rt_state = _has_rt_keys(state_dict)
+
+    # ── Validación estricta para evitar carga silenciosa ──
+    if use_rt and not has_rt_state:
+        raise ValueError(
+            "Checkpoint says use_rt=True but has no 'rv.*' keys in state_dict. "
+            "The checkpoint is corrupted or saved incorrectly."
+        )
+    if not use_rt and has_rt_state:
+        raise ValueError(
+            "Checkpoint has 'rv.*' keys but use_rt=False in payload. "
+            "This checkpoint requires RT. Refusing to load to avoid silent "
+            "corruption (rv weights would be dropped by strict=False)."
+        )
+    if not use_rt and cfg.use_rt:
+        raise ValueError(
+            "Checkpoint was saved without RT but config.use_rt=True. "
+            "Would create a partial RT model. Refusing."
+        )
 
     if use_rt:
         from .tokenizer import ResonantVocab, RVConfig, RTModelWrapper
@@ -99,10 +129,19 @@ def load_checkpoint(path: str, model_class, device="cpu", load_optimizer: bool =
         rv = ResonantVocab.from_bpe(bpe_path, rv_cfg)
         snnlm = model_class(cfg)
         model = RTModelWrapper(snnlm, rv, aux_loss_weight=cfg.rt_aux_loss_weight)
-        model.load_state_dict(ckpt["model"], strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        # strict=False solo debería tolerar buffers persistent=False ausentes
+        if unexpected:
+            raise ValueError(
+                f"Unexpected keys in checkpoint: {unexpected[:10]}"
+            )
     else:
         model = model_class(cfg)
-        model.load_state_dict(ckpt["model"], strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            raise ValueError(
+                f"Unexpected keys in checkpoint: {unexpected[:10]}"
+            )
 
     model.to(device)
 
