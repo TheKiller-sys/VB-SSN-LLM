@@ -1,7 +1,7 @@
 """Configuración completa del modelo, validación y resolución de device."""
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import json
 import os
 import warnings
@@ -97,6 +97,21 @@ class GPTConfig:
     analyzer_prune_memory: bool = True
     analyzer_refresh_codebook: bool = True
 
+    # ---- RAG (v4.2) ----
+    rag_enabled: bool = False
+    rag_kb_path: str = ""
+    rag_top_k: int = 4
+    rag_max_context_chars: int = 2000
+    rag_encoder: str = "hidden"  # "hidden" | "sentence_transformer:<name>"
+
+    # ---- LoRA (v4.2) ----
+    lora_enabled: bool = False
+    lora_r: int = 8
+    lora_alpha: float = 16.0
+    lora_dropout: float = 0.0
+    lora_targets: list = field(default_factory=lambda: ["qkv", "proj", "fc1", "fc2"])
+    lora_path: str = ""
+
     # ---- entrenamiento ----
     batch_size: int = 8
     grad_accum_steps: int = 1
@@ -122,9 +137,9 @@ class GPTConfig:
     num_workers: int = 0
     pin_memory: bool = True
 
-    # En GPTConfig, dentro de la sección "---- sistema ----" o antes:
-    code_corpus: bool = False       # NUEVO: activa CodeCorpusObserver
-    split_by: str = "file"          # NUEVO: "file" | "repo"
+    # ---- corpus ----
+    code_corpus: bool = False
+    split_by: str = "file"
 
     def validate(self) -> None:
         checks = [
@@ -181,8 +196,14 @@ class GPTConfig:
             (self.rt_commitment_beta >= 0, "rt_commitment_beta must be >= 0"),
             (self.rt_min_count_for_update >= 0, "rt_min_count_for_update must be >= 0"),
             (self.rt_concept_top_k_tokens >= 1, "rt_concept_top_k_tokens must be >= 1"),
-            # Dentro de la lista `checks`:
             (self.split_by in ("file", "repo"), f"invalid split_by: {self.split_by}"),
+            # RAG
+            (self.rag_top_k >= 1, "rag_top_k must be >= 1"),
+            (self.rag_max_context_chars >= 0, "rag_max_context_chars must be >= 0"),
+            # LoRA
+            (self.lora_r > 0, "lora_r must be > 0"),
+            (self.lora_alpha > 0, "lora_alpha must be > 0"),
+            (0.0 <= self.lora_dropout < 1.0, "lora_dropout must be in [0, 1)"),
         ]
         for ok, msg in checks:
             if not ok:
@@ -211,9 +232,19 @@ class GPTConfig:
                 "torch.compile + use_rt may cause graph breaks (VQ quantization).",
                 RuntimeWarning, stacklevel=3,
             )
+        if self.compile and self.lora_enabled:
+            warnings.warn(
+                "torch.compile + lora: apply_lora MUST be called before compile.",
+                RuntimeWarning, stacklevel=3,
+            )
         if self.temporal_mode_uses_memory():
             warnings.warn(
                 "snn_mode='temporal' + neural_memory_enabled: slow.",
+                RuntimeWarning, stacklevel=3,
+            )
+        if self.rag_enabled and not self.rag_kb_path:
+            warnings.warn(
+                "rag_enabled=True but rag_kb_path is empty. RAG will be no-op.",
                 RuntimeWarning, stacklevel=3,
             )
 
