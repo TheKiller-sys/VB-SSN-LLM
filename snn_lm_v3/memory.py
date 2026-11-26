@@ -1,4 +1,4 @@
-"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.2.
+"""Memoria neural, abstracción geométrica y autoconocimiento para SNN-LM v4.2.1.
 
 Thread safety:
   - `NeuralMemory` y `AbstractionHead` usan `threading.RLock` interno.
@@ -10,6 +10,10 @@ Semántica de `update` (FIX v4.2):
     durante el entrenamiento y NO se toca en eval/inference.
   - `update=True` -> fuerza actualización (continual learning / generation).
   - `update=False` -> solo retrieval, sin escritura.
+
+FIX v4.2.1 (Hebbian numerics):
+  - `flat` y `delta` se clampean ANTES de `W.add_` para evitar overflow
+    con `float16` bajo AMP.
 """
 from __future__ import annotations
 
@@ -207,7 +211,15 @@ class NeuralMemory(nn.Module):
             if n < 2:
                 return
 
+            # ── FIX v4.2.1: clampear flat antes del outer product ──
+            flat = flat.clamp(-self.norm_clamp, self.norm_clamp)
+
             delta = (flat.T @ flat) / n
+
+            # ── FIX v4.2.1: clampear delta ANTES de W.add_ ──
+            delta_norm = delta.norm()
+            if delta_norm > self.norm_clamp:
+                delta = delta * (self.norm_clamp / delta_norm)
 
             W = self.W_mem.weight.data
             W.mul_(self.hebbian_decay)
